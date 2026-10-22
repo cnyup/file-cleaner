@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,9 +58,26 @@ func buildJobs(cfg *config.Config) ([]*job, error) {
 	return jobs, nil
 }
 
-// daemonLoop 调度主循环：最近触发的 job 先跑；ctx 取消即返回。
+// runJobFn / purgeJobFn 是 job 执行的注入缝：生产传 runner 包装，
+// 测试传可控闭包（并行行为测试见 daemon_parallel_test.go）。
+type runJobFn func(ctx context.Context, pol *config.Policy) error
+
+// daemonLoop 调度主循环：job 触发即起 goroutine（全局信号量限并发，
+// max_concurrent_runs，缺省 2），主循环永不阻塞、不错过触发；
+// ctx 取消时等待全部 in-flight job 结束后返回。
 // 输出写 w（测试可注入 buffer；生产传 os.Stdout）。
 func daemonLoop(ctx context.Context, cfg *config.Config, w io.Writer) {
+	daemonLoopWith(ctx, cfg, w, func(ctx context.Context, p *config.Policy) error {
+		_, err := runner.RunOnce(ctx, cfg, p, false)
+		return err
+	}, func(p *config.Policy) error {
+		_, err := runner.Purge(cfg, p)
+		return err
+	})
+}
+
+// daemonLoopWith 可注入版本：runFn/purgeFn 由调用方提供。
+func daemonLoopWith(ctx context.Context, cfg *config.Config, w io.Writer, runFn runJobFn, purgeFn func(*config.Policy) error) {
 	jobs, err := buildJobs(cfg)
 	if err != nil {
 		fmt.Fprintf(w, "daemon: %v\n", err)
@@ -71,9 +89,28 @@ func daemonLoop(ctx context.Context, cfg *config.Config, w io.Writer) {
 	}
 	fmt.Fprintf(w, "daemon: %d scheduled jobs\n", len(jobs))
 
-	// on-start 轮：run_on_start=true 时启动即清理（消除部署到首个
-	// cron 触发间的空窗）。走 daemonLoop 内同一执行路径与策略锁；
-	// 单个失败不阻塞其余 job——错误处理与定时轮一致（打印继续）。
+	sem := make(chan struct{}, cfg.ConcurrentRuns())
+	var wg sync.WaitGroup
+
+	// runJob 触发一个 job：goroutine 内先取信号量（排队期间 ctx 取消
+	// 可退出），再执行。同策略重入由 flock 拦截（忙则跳过）。
+	runJob := func(j *job, exec func() error, label string) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return // 排队中被取消：直接放弃
+			}
+			defer func() { <-sem }()
+			if err := exec(); err != nil {
+				fmt.Fprintf(w, "daemon: %s %s: %v\n", label, j.pol.ID, err)
+			}
+		}()
+	}
+
+	// on-start 轮：与定时轮同一并行路径与策略锁；单个失败不阻塞其余。
 	if cfg.RunOnStart {
 		for _, j := range jobs {
 			if ctx.Err() != nil {
@@ -83,9 +120,7 @@ func daemonLoop(ctx context.Context, cfg *config.Config, w io.Writer) {
 				continue // purge 有独立 purge_schedule，on-start 只补清理欠账
 			}
 			fmt.Fprintf(w, "daemon: on-start run policy %s\n", j.pol.ID)
-			if _, err := runner.RunOnce(ctx, cfg, j.pol, false); err != nil {
-				fmt.Fprintf(w, "daemon: on-start %s: %v\n", j.pol.ID, err)
-			}
+			runJob(j, func() error { return runFn(ctx, j.pol) }, "on-start")
 		}
 	}
 
@@ -106,6 +141,7 @@ func daemonLoop(ctx context.Context, cfg *config.Config, w io.Writer) {
 			fmt.Fprintln(w, "daemon: no future triggers, idling")
 			<-ctx.Done()
 			fmt.Fprintln(w, "daemon: shutting down")
+			wg.Wait()
 			return
 		}
 		wait := time.Until(soonest.next)
@@ -114,27 +150,27 @@ func daemonLoop(ctx context.Context, cfg *config.Config, w io.Writer) {
 			case <-time.After(wait):
 			case <-ctx.Done():
 				fmt.Fprintln(w, "daemon: shutting down")
+				wg.Wait()
 				return
 			}
 		}
 		if ctx.Err() != nil {
 			fmt.Fprintln(w, "daemon: shutting down")
+			wg.Wait()
 			return
 		}
 		j := soonest
+		// 触发瞬间推进 next（不等执行完成——并行下执行时长与调度
+		// 解耦；若执行后才推进，慢 job 会导致重复触发）。
+		j.next = j.sch.Next(time.Now())
 		switch j.kind {
 		case jobRun:
 			fmt.Fprintf(w, "daemon: run policy %s\n", j.pol.ID)
-			if _, err := runner.RunOnce(ctx, cfg, j.pol, false); err != nil {
-				fmt.Fprintf(w, "daemon: policy %s: %v\n", j.pol.ID, err)
-			}
+			runJob(j, func() error { return runFn(ctx, j.pol) }, "policy")
 		case jobPurge:
 			fmt.Fprintf(w, "daemon: purge policy %s\n", j.pol.ID)
-			if _, err := runner.Purge(cfg, j.pol); err != nil {
-				fmt.Fprintf(w, "daemon: purge %s: %v\n", j.pol.ID, err)
-			}
+			runJob(j, func() error { return purgeFn(j.pol) }, "purge")
 		}
-		j.next = j.sch.Next(time.Now())
 	}
 }
 

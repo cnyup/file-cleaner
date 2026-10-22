@@ -33,6 +33,13 @@ type Config struct {
 	// 清理再进入定时循环（消除部署到首个 cron 触发间的空窗）。
 	// on-start 轮走同一把策略锁：上次未完成则跳过，不与 cron 轮并行。
 	RunOnStart bool `yaml:"run_on_start"`
+	// MaxConcurrentRuns 并行执行上限（全局信号量）：多策略调度在同一
+	// 时刻触发时，最多 N 个 RunOnce/Purge 同时执行；其余 job 触发即
+	// 入队、在信号量上等待（ctx 取消可退出）。=1 退化为完全串行
+	// （现历史行为）。缺省 2。
+	// 拓扑提示：不同 NAS 存储 ≈ 吞吐叠加；同一 NFS 服务器的多个
+	// export 并行会在服务端争元数据吞吐（readdir 密集型扫描）。
+	MaxConcurrentRuns int `yaml:"max_concurrent_runs"`
 	// AuditLog 审计日志轮转（全局）。不配 = daily + 15d（默认行为）。
 	AuditLog AuditLog `yaml:"audit_log"`
 	Policies  []Policy `yaml:"policies"`
@@ -75,6 +82,17 @@ func (c *Config) AuditRetentionDur() (time.Duration, error) {
 		return 0, err
 	}
 	return d, nil
+}
+
+// maxConcurrentRunsDefault 并行执行上限缺省值。
+const maxConcurrentRunsDefault = 2
+
+// ConcurrentRuns 返回规范化并行上限（0/未配 → 2）。
+func (c *Config) ConcurrentRuns() int {
+	if c.MaxConcurrentRuns <= 0 {
+		return maxConcurrentRunsDefault
+	}
+	return c.MaxConcurrentRuns
 }
 
 // Policy 是单个清理策略。
@@ -214,6 +232,11 @@ func Validate(cfg *Config) []error {
 	seen := map[string]bool{}
 	if cfg.StateDir == "" {
 		errs = append(errs, fmt.Errorf("state_dir is required"))
+	}
+	// max_concurrent_runs：显式配置 <1 即非法（缺省/0 走默认 2，
+	// YAML 显式 0 也按缺省处理——语义是"未有效指定"）
+	if cfg.MaxConcurrentRuns < 0 {
+		errs = append(errs, fmt.Errorf("max_concurrent_runs must be >= 1, got %d", cfg.MaxConcurrentRuns))
 	}
 	// audit_log 段：模式与保留期 fail-closed 校验
 	switch cfg.AuditRotationMode() {
