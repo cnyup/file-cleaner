@@ -1,82 +1,136 @@
 # filecleaner
 
-面向 TB 级 NFS 的定时文件清理工具：全量扫描、按目录策略、软删除可恢复、审计可溯源。
+**Production-safe scheduled cleaner for NFS-mounted directory trees — soft-delete first, audit everything.**
 
-## 范围
+[![Go Version](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
+[![Platform](https://img.shields.io/badge/platform-linux-646C71?logo=linux)](https://kernel.org)
+[![Build](https://img.shields.io/badge/build-CGO--free-8CC84B)](./go.mod)
 
-- Linux 执行机 + NFS 挂载（单机运行清理；其他机器可同时读写 NFS）
-- 每目录一条策略：cron 调度、mtime/ctime/atime AND/OR 条件、目录与 glob/正则排除
-- 软删除：同文件系统 rename 进日期分桶回收站，保留原目录结构
-- 删除分两阶段：到期桶整桶 retire（O(1)，毫秒级）+ 后台物理删除（异步，不阻塞）
-- 恢复不覆盖已有文件；桶 retire 后不可恢复（保留期语义）
-- 审计：本地 JSONL（预提交事务）+ SQLite 投影查询
+`filecleaner` runs as a daemon on a Linux host with NFS mounts, scans directory trees on schedule, and moves expired files into a date-bucketed trash area via `rename(2)` — cheap on NFS, reversible for a retention window, and fully audited in an intent-before-action transaction log.
 
-## 回收站布局（日期分桶）
+It is built for the harsh end of the spectrum: **multi-million-file trees, deep-narrow layouts, shared storage where other machines write concurrently, and hard-mounted NFS where a stalled RPC puts your process in D-state.**
 
-```text
-<root>/.filecleaner-trash/
-  2026-09-29.run-9c45a6/   ← 活跃桶：每轮 once 一个桶，原相对路径结构
-  .retired/                 ← 已到期隔离区（retire 目标，等待物理删除）
-  .purging/                 ← 物理删除中（崩溃标记，重启续删）
-```
+---
 
-```mermaid
-flowchart LR
-    A[源目录<br/>命中策略] -->|rename 逐文件| B[活跃桶<br/>保留期内可 restore]
-    B -->|到期 retire<br/>O&#40;1&#41; rename ~34ms| C[.retired]
-    C -->|sweep 领取| D[.purging]
-    D -->|后台逐文件 unlink<br/>~110/s 异步| E[空间释放]
-    B -->|restore 反 rename| A
-```
+## Why not `find /data -mtime +30 -delete`?
 
-到期判定按桶日期粒度（日期 23:59:59 早于 cutoff 才 retire），**最短有效 trash.retention = 1 天**。
+| | `find -delete` | rsync/tmpwatch style | filecleaner |
+|---|---|---|---|
+| Recovery window after a bad match | ❌ none — unlink is final | ❌ partial | ✅ trash retention (default 10d), `restore` command |
+| Proof of what was deleted, when | ❌ exit code | ⚠ verbose logs, best-effort | ✅ pre-commit JSONL audit + SQLite projection, per-file `ok` |
+| Crash mid-run | ❌ unknown state | ⚠ unknown state | ✅ intent fsynced before action; open intents enumerated on restart |
+| Wrong-mount / empty-mount protection | ❌ deletes anyway | ❌ | ✅ `st_dev` guard, `RequiresMountsFor` unit, fail-closed excludes |
+| Deleting on live NFS | ⚠ metadata storms | ⚠ | ✅ concurrent rename batches, per-tree tuned worker pools |
+| Empty dir cleanup | ❌ | ⚠ racy | ✅ TOCTOU recheck + mtime age gate + `ENOTEMPTY` kernel backstop |
 
-## 快速开始
+The short version: `find` optimizes for *space reclaim now*. filecleaner optimizes for *being able to answer "what happened to that file" three weeks later* — while still reclaiming space.
+
+## Features
+
+- **Soft delete with date-bucketed trash** — files move into `<root>/.filecleaner-trash/2026-10-22.run-<id>/` preserving relative paths. Retire at expiry is an O(1) directory rename (~34 ms), physical unlink happens asynchronously in the background.
+- **Restore before expiry** — `filecleaner restore` walks the audit projection, finds the bucket holding your file, moves it back. Refuses to overwrite existing files.
+- **Audit-first transaction log** — every batch persists `intent` records (fsync) *before* touching the filesystem, then per-file `result` records. Any crash leaves either intent-only or intent+result — never an untracked modification. JSONL shards rotate daily by default, retention configurable.
+- **Per-policy matching** — cron schedule, `mtime`/`ctime`/`atime` conditions combined with AND/OR, quiet-period check, basename dir excludes, glob/regex file excludes.
+- **Empty-directory sweep** — removes directories that are empty and mtime-older than a gate (POSIX mtime updates on entry add/remove, so freshly-emptied dirs are naturally protected). Three-layer safety: readdir recheck → age gate → kernel `ENOTEMPTY` backstop.
+- **NFS-tuned concurrency** — separate worker pools for directory reads, `lstat` storms, and rename batches. Throughput bottleneck on deep-narrow trees is directory traversal, not stat parallelism (bench-proven; see below).
+- **Crash-safe three-zone lifecycle** — active buckets / `.retired/` / `.purging/` separated by atomic renames; restart resumes physical deletion idempotently.
+- **Single static binary** — pure Go, `CGO_ENABLED=0`, no runtime deps beyond the SQLite projection (modernc, no cgo).
+
+## Quick start
 
 ```bash
+git clone https://github.com/cnyup/file-cleaner.git
+cd file-cleaner
 CGO_ENABLED=0 go build -o filecleaner ./cmd/filecleaner
 
-cp config.example.yaml config.yaml   # 编辑策略
+cp config.example.yaml config.yaml    # edit policies for your tree
 ./filecleaner validate --config config.yaml
 ./filecleaner once --config config.yaml --policy video-data-daily --dry-run
 ./filecleaner once --config config.yaml --policy video-data-daily
 ```
 
-## 子命令
+A minimal policy:
 
+```yaml
+state_dir: /var/lib/filecleaner
+
+policies:
+  - id: my-tree
+    root: /mnt/nfs/data
+    schedule: "30 2 * * *"
+    retention:
+      match: AND
+      conditions:
+        mtime_older_than: 30d
+        atime_older_than: 30d
+    trash:
+      retention: 10d
+      purge_schedule: "15 4 * * *"
+    empty_dirs:
+      enabled: true
+      retention: 7d
 ```
-filecleaner validate --config <yaml>
-filecleaner once    --config <yaml> --policy <id> [--dry-run]
-filecleaner restore --config <yaml> --policy <id> --path <rel>
-filecleaner purge   --config <yaml> --policy <id>   # retire 到期桶，毫秒级返回
-filecleaner sweep   --config <yaml> [--policy <id>] # 手动物理删除 .retired/.purging
-filecleaner audit query --config <yaml> [--policy <id>]
-filecleaner audit rebuild --config <yaml> [--check-open]  # 重建投影 / 列出未闭环 intent
-filecleaner bench scan --root <dir> [--stat-workers 1,4,8,16,32,64]
-filecleaner daemon  --config <yaml>                 # 主清理 + purge + sweeper 巡检
+
+Full reference for every key and default: [`config.example.yaml`](config.example.yaml).
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Source tree<br/>policy match] -->|rename, batched| B[Active bucket<br/>restore window]
+    B -->|expiry retire<br/>O(1) rename ~34ms| C[.retired]
+    C -->|sweep claims| D[.purging]
+    D -->|background unlink| E[space reclaimed]
+    B -->|restore| A
 ```
 
-daemon 内含三条调度线：各策略 `schedule`（主清理）、`trash.purge_schedule`（retire）、SweepLoop 每小时物理删除。
+- **Deletion is two-phase by design.** Logical deletion (retire) is instantaneous and holds the policy lock for milliseconds; physical deletion runs in an hourly sweeper loop that never touches buckets that did not pass through `.retired/` (fail-closed).
+- **The audit log is the source of truth.** The SQLite store is a rebuildable projection (`audit rebuild` reconstructs it from JSONL). Restore queries the projection; pruning respects the invariant that audit shards always outlive trash retention.
+- **Daemon = three independent schedules.** Per-policy `schedule` (clean), `purge_schedule` (retire), and an hourly sweeper (physical delete). Same-policy operations serialize via flock; an unfinished run causes the next trigger to skip.
 
-## 安全不变量
+## CLI reference
 
-1. 每批 rename 前 intent 已 fsync 到 JSONL；审计不可写 → 该批零文件操作
-2. trash 与 root 不同 st_dev → 策略禁用；EXDEV 记错，绝不 copy
-3. 排除优先；符号链接不跟随；回收站目录永不进入扫描
-4. **sweep 只删进过 `.retired` 的桶；活跃桶与未知文件永不删**（fail-closed）
-5. 同策略锁（flock）：上次未完成 → 本次跳过；retire 持锁毫秒级
-6. scan/drain/total 分开计时，禁止用总时长冒充扫描时长
-7. 崩溃安全：活跃桶/`.retired`/`.purging` 三区由 rename 原子分隔，重启幂等续删
+| Command | Purpose |
+|---|---|
+| `validate` | Fail-closed config check (schema, cron, cross-field invariants) |
+| `once` | Run one policy now (`--dry-run` reports matches without moving) |
+| `daemon` | All schedules + sweeper + audit rotation/prune loop |
+| `restore` | Move a file back from trash by relative path |
+| `purge` | Retire expired buckets (manual trigger; daemon does this on schedule) |
+| `sweep` | Manually run physical deletion of `.retired`/`.purging` |
+| `audit query` / `audit rebuild` | Query projection; rebuild it; `--check-open` lists crash-orphaned intents |
+| `bench scan` | Measure scan throughput for a tree to tune worker counts |
 
-## 性能口径
+## Safety invariants
 
-见 docs/performance.md。关键实测（阿里云容量型 NAS，600 万文件）：
+1. Intent records are fsynced **before** any file operation; if the audit log is unwritable, zero files are touched.
+2. Trash must share `st_dev` with root — cross-device fallback is rejected, never copy.
+3. Excludes win over matches; symlinks are never followed; the trash tree itself is never scanned.
+4. Sweeper deletes only buckets that passed through `.retired/`; active buckets and unknown files are never touched.
+5. Per-policy flock: an unfinished run blocks re-entry rather than overlapping.
+6. Timers separate scan / drain / total elapsed — total wall time never masquerades as scan time.
+7. Empty-dir removal triple-checks: readdir immediately before `rmdir`, mtime age gate, kernel `ENOTEMPTY`.
 
-- 扫描：23,067 files/s（旧工具 7,895，快 2.9 倍，超 50% 目标）
-- retire（逻辑删除）：34ms/桶，与桶内文件数无关（旧逐文件 purge 同规模 46s）
-- 物理删除：后台 ~110/s（NAS 元数据写物理墙，异步不阻塞前台）
-- 软删除入桶：~120/s（同一物理墙；建议 move_workers=16 并配业务低峰窗口）
+## Benchmarks
 
-## 运维
+Measured on cloud capacity-tier NFS, 6M files / 1M dirs, production-shaped deep-narrow tree:
 
-见 docs/operations.md。
+| Operation | filecleaner | predecessor tool |
+|---|---|---|
+| Full scan | **23,067 files/s** | 7,895 files/s (2.9×) |
+| Retire 1 bucket (logical delete) | **34 ms**, independent of file count | ~46 s per equivalent batch |
+| Physical delete (background) | ~110 files/s (NAS metadata wall; async, non-blocking) | same wall |
+| Soft-delete ingest | ~120 files/s (same wall; tune `move_workers` + off-peak window) | — |
+
+Tuning note from these benches: raising `dir_read_workers` scales throughput nearly linearly (4.3k → 17.1k files/s at 8 → 64 workers); raising `stat_workers` beyond ~32 gains almost nothing on deep-narrow trees.
+
+## Documentation
+
+- [`config.example.yaml`](config.example.yaml) — every key, default, and constraint annotated
+- [`docs/operations.md`](docs/operations.md) — runbook: restore drills, audit forensics, daemon supervision
+- [`docs/performance.md`](docs/performance.md) — benchmark methodology and NFS-specific findings
+- [`docs/superpowers/specs/`](docs/superpowers/specs/) — design docs (trash bucketing, core architecture)
+
+## License
+
+Not yet chosen — add a `LICENSE` file before relying on this in production.
