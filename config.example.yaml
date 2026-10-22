@@ -1,0 +1,92 @@
+# filecleaner 配置示例 —— 全量配置项参考
+# 所有键都是必填项之外的可选项：不配走注释中标注的默认值。
+# 字段语义详情见 docs/operations.md。
+
+# ============================ 全局段 ============================
+
+# state_dir（必填）：状态目录——审计 JSONL、SQLite 投影（audit.db）、
+# 策略锁文件都放这里。必须是持久路径（/tmp 重启会丢审计，
+# 审计是 restore 的唯一依据）。
+state_dir: /var/lib/filecleaner
+
+# run_on_start：daemon 启动即对每个 run 策略补一轮清理
+# （消除部署/重启到首个 cron 触发之间的空窗）。
+# on-start 轮与 cron 轮共用同一把策略锁：上次未完成则跳过，不并行。
+# 默认 false。
+run_on_start: false
+
+# audit_log：审计日志轮转（全局，2026-10 起支持）。
+#   rotation:
+#     daily（默认）—— 按天切割为 audit-YYYYMMDD.jsonl 分片，
+#                      超过 retention 的分片由 daemon 自动删除
+#                      （启动时一次 + 每 24h 一次，动作写 journal）。
+#     off          —— 旧行为：单文件 audit.jsonl，永不自动清理。
+#                      （这也是「永久保留」的语义载体）
+#   retention：分片保留期；不配 = 15d。
+#   ⚠ 约束：任一策略 trash.retention 必须 < audit_log.retention
+#   （audit 分片是 restore 的依据，先于回收站到期删除会导致
+#    restore 找不到记录——Validate fail-closed 拦截）。
+#   legacy audit.jsonl 永远不会被自动删除（运维手动处置）。
+audit_log:
+  rotation: daily
+  retention: 15d
+
+# ============================ 策略列表 ============================
+
+policies:
+  # 每个策略 = 一个数据根 + 一套清理规则。策略间串行调度。
+  - id: video-data-daily          # 必填且全局唯一
+    root: /mnt/nfs/video-data     # 必填：清理的数据根
+
+    # schedule：cron 五段式（分 时 日 月 周）。不配 = 只能手动触发
+    # （filecleaner once）。
+    schedule: "30 2 * * *"
+
+    # retention：文件命中条件（必填 conditions，至少一条）。
+    retention:
+      match: AND                  # AND | OR，多条件的组合方式，默认 AND
+      conditions:
+        mtime_older_than: 30d     # mtime/ctime/atime 任意组合；
+        # atime_older_than: 30d   # 时长格式：30d / 24h / 30m / 10s
+        # ctime_older_than: 30d
+      # min_quiet_period：静默期检查——近该时长内 mtime/ctime 有变动
+      # 的文件跳过（防误删正在写入的文件）。不配 = 不检查。
+      min_quiet_period: 1h
+
+    # exclusions：排除规则（可省）。
+    exclusions:
+      # dirs：按 basename 排除目录（含其子树），不进扫描不进回收站。
+      dirs: ["tmp", ".snapshots"]
+      # patterns：文件名 glob 排除；re: 前缀 = 正则。
+      patterns: ["*.log", "re:^keep_"]
+
+    # trash：软删除回收站（不配 = 直接删除，不推荐）。
+    trash:
+      # dir：回收站目录名。必须是相对 root 的单段名
+      # （默认 .filecleaner-trash，root 下自动创建）。
+      # 必须与 root 同一文件系统（跨盘 rename 会退化为 copy）。
+      dir: .filecleaner-trash
+      # retention：回收站保留期。到期桶被 retire（rename 到
+      # .retired/）后由 sweeper 异步物理删除。
+      retention: 30d
+      # purge_schedule：retire 检查的 cron。不配 = 不自动 retire。
+      purge_schedule: "15 4 * * *"
+
+    # empty_dirs：空目录清理（可省，不配即关）。
+    # 判定 = readdir 为空 + 目录 mtime 超 retention（mtime-only：
+    # 本工具每日 readdir 会刷 atime，atime 门永不放行；目录 mtime
+    # 在条目增删时都更新，天然挡住刚清空的目录）。
+    # rmdir 物理删除——非空目录必然失败，无数据丢失路径。
+    empty_dirs:
+      enabled: true
+      retention: 7d               # enabled 时必填：空目录年龄门
+
+    # concurrency：并发调优（可省，走默认）。
+    # 依据生产 bench（深窄目录树）：吞吐瓶颈在目录读取而非 stat——
+    # 加大 dir_read_workers 收益近线性，加大 stat_workers 几乎无收益。
+    concurrency:
+      dir_read_workers: 8         # 目录遍历并发。默认 8。
+      stat_workers: 32            # lstat 并发。默认 8。
+      move_workers: 8             # 移动（rename）并发。默认 8。
+      max_ops_per_sec: 0          # 全局限速（ops/s）。0 = 不限速；
+                                  # 只在需要给业务让路时设置

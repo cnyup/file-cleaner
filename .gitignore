@@ -1,0 +1,10 @@
+/filecleaner
+/bin/
+*.log
+.rivet/
+
+# 本地运维文件（不进公开仓库）
+AGENTS.md
+config.nas-prod-ali-bj.yaml
+docs/handover-*.md
+.rivet.md

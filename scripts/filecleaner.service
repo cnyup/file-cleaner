@@ -1,0 +1,40 @@
+# filecleaner systemd 单元模板（通用版）
+# 按部署环境替换 <NAS-MOUNT-POINT>、<INSTALL-DIR>、<CONFIG-PATH>
+# 三个占位符后安装到 /etc/systemd/system/filecleaner.service。
+#
+# 要点（生产实测定型的决策，细节注释见各段）：
+# - RequiresMountsFor=NFS 挂载点——挂载未就绪不拉起服务，避免 NAS
+#   掉线时空跑（NFS hard 挂载失联时 worker 进 D 状态等 RPC）
+# - 必须以 root 运行：NFS 权限在服务端按 RPC UID 检查，专用用户
+#   （filecleaner）对多属主业务目录无 rename 权限——实测两轮真删
+#   0 文件移动、100% 批 EACCES；CAP_DAC_OVERRIDE 不跨 NFS，
+#   专用用户路线在此类树上结构性不可行
+# - 沙箱对 root 全部保留生效：写面钉死在 NAS 根与状态目录
+# - TimeoutStopSec：给长跑中的 run 轮留优雅退出时间
+
+[Unit]
+Description=filecleaner scheduled NFS cleanup
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=<NAS-MOUNT-POINT>
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=<INSTALL-DIR>/filecleaner daemon --config <CONFIG-PATH>
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=600
+StateDirectory=filecleaner
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+# ProtectSystem=strict 使整个文件系统只读：NAS 根（软删 rename +
+# 回收站）与状态目录（审计/投影/锁）必须显式放开。
+# StateDirectory 只覆盖状态目录，NAS 这条漏了软删会全部失败。
+ReadWritePaths=<NAS-MOUNT-POINT>
+ReadWritePaths=/var/lib/filecleaner
+
+[Install]
+WantedBy=multi-user.target
