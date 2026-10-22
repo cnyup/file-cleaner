@@ -69,7 +69,9 @@ sequenceDiagram
     Note over J,F: 任何时刻崩溃：盘上要么只有 intent（未执行/执行一半），<br/>要么 intent+result 齐全——不存在无审计的文件变动。<br/>重启后 FindOpenIntents 枚举未闭环意图供核对。
 ```
 
-## daemon 架构（三条独立调度线）
+## daemon 架构（三条独立调度线 + 受限并行）
+
+同一时刻到期的多策略按 `max_concurrent_runs`（缺省 2，=1 即完全串行）并行执行；同策略仍由 flock 严格串行（上一轮未完成，本轮跳过）。
 
 ```mermaid
 flowchart TB

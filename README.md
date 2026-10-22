@@ -88,7 +88,7 @@ flowchart LR
 
 - **Deletion is two-phase by design.** Logical deletion (retire) is instantaneous and holds the policy lock for milliseconds; physical deletion runs in an hourly sweeper loop that never touches buckets that did not pass through `.retired/` (fail-closed).
 - **The audit log is the source of truth.** The SQLite store is a rebuildable projection (`audit rebuild` reconstructs it from JSONL). Restore queries the projection; pruning respects the invariant that audit shards always outlive trash retention.
-- **Daemon = three independent schedules.** Per-policy `schedule` (clean), `purge_schedule` (retire), and an hourly sweeper (physical delete). Same-policy operations serialize via flock; an unfinished run causes the next trigger to skip.
+- **Daemon = three independent schedules.** Per-policy `schedule` (clean), `purge_schedule` (retire), and an hourly sweeper (physical delete). Same-policy operations serialize via flock; an unfinished run causes the next trigger to skip. Policies triggered at the same moment run in parallel up to `max_concurrent_runs` (default 2, `1` = fully serial).
 
 ## Audit transaction protocol (the crash-safety core)
 

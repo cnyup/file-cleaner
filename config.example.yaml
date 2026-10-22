@@ -15,6 +15,14 @@ state_dir: /var/lib/filecleaner
 # 默认 false。
 run_on_start: false
 
+# max_concurrent_runs：多策略同时到期时的并行执行上限（全局信号量，
+# 缺省 2；=1 恢复完全串行）。触发即入队，超限 job 后台排队等待；
+# 同策略重入由策略锁拦截（忙则跳过，不堆叠）。
+# 拓扑建议：不同 NAS 存储 ≈ 吞吐叠加，可放心并行；同一台 NFS 服务
+# 器的多个 export 会争服务端元数据吞吐（readdir 密集型扫描），
+# 收益有限但无害。
+max_concurrent_runs: 2
+
 # audit_log：审计日志轮转（全局，2026-10 起支持）。
 #   rotation:
 #     daily（默认）—— 按天切割为 audit-YYYYMMDD.jsonl 分片，
