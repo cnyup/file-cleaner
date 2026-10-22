@@ -2,6 +2,8 @@
 
 **Production-safe scheduled cleaner for NFS-mounted directory trees — soft-delete first, audit everything.**
 
+English | [简体中文](README.zh-CN.md)
+
 [![Go Version](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![Platform](https://img.shields.io/badge/platform-linux-646C71?logo=linux)](https://kernel.org)
 [![Build](https://img.shields.io/badge/build-CGO--free-8CC84B)](./go.mod)
@@ -87,6 +89,26 @@ flowchart LR
 - **Deletion is two-phase by design.** Logical deletion (retire) is instantaneous and holds the policy lock for milliseconds; physical deletion runs in an hourly sweeper loop that never touches buckets that did not pass through `.retired/` (fail-closed).
 - **The audit log is the source of truth.** The SQLite store is a rebuildable projection (`audit rebuild` reconstructs it from JSONL). Restore queries the projection; pruning respects the invariant that audit shards always outlive trash retention.
 - **Daemon = three independent schedules.** Per-policy `schedule` (clean), `purge_schedule` (retire), and an hourly sweeper (physical delete). Same-policy operations serialize via flock; an unfinished run causes the next trigger to skip.
+
+## Audit transaction protocol (the crash-safety core)
+
+```mermaid
+sequenceDiagram
+    participant R as RunOnce (clean cycle)
+    participant J as JSONL audit
+    participant F as NFS filesystem
+
+    R->>J: ① batch intent (256/batch) + fsync
+    alt audit write fails
+        J-->>R: refuse to continue
+        R->>F: zero file operations (fail-closed)
+    else intents persisted
+        R->>F: ② execute batch renames (per file)
+        F-->>R: per-file physical results
+        R->>J: ③ batch result (per-file ok/err) + fsync
+    end
+    Note over J,F: Crash at any moment: disk holds either intent-only (not executed / partially executed)<br/>or intent+result complete — never an untracked modification.<br/>On restart, FindOpenIntents enumerates open intents for reconciliation.
+```
 
 ## CLI reference
 
