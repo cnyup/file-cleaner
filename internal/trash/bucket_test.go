@@ -43,7 +43,7 @@ func TestRetireBucketIsORename(t *testing.T) {
 	mustWrite(t, reqs[0].Src, "v1")
 	mustWrite(t, reqs[1].Src, "v2")
 	bucket := layout.NewBucketName(time.Now())
-	if _, err := m.MoveBatchBucket("r1", "p1", bucket, reqs, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatchBucket("r1", "p1", bucket, reqs, Recheck{}); err != nil {
 		t.Fatalf("MoveBatchBucket: %v", err)
 	}
 	bucketDir := layout.BucketDir(bucket)
@@ -80,7 +80,7 @@ func TestRestoreFromBucket(t *testing.T) {
 	src := filepath.Join(root, "x.txt")
 	mustWrite(t, src, "data")
 	bucket := layout.NewBucketName(time.Now())
-	if _, err := m.MoveBatchBucket("r1", "p1", bucket, []MoveReq{{Src: src, Rel: "x.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatchBucket("r1", "p1", bucket, []MoveReq{{Src: src, Rel: "x.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	// 活跃桶恢复成功
@@ -93,7 +93,7 @@ func TestRestoreFromBucket(t *testing.T) {
 
 	// 再移入并 retire，恢复必须拒绝
 	mustWrite(t, src, "data2")
-	if _, err := m.MoveBatchBucket("r3", "p1", bucket, []MoveReq{{Src: src, Rel: "x.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatchBucket("r3", "p1", bucket, []MoveReq{{Src: src, Rel: "x.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Retire("p1", bucket); err != nil {

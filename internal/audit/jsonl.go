@@ -74,6 +74,18 @@ func (j *JSONL) Path() string { return j.path }
 // 批内部分成功不被误记失败，err 归因到各自文件。返回首个非 nil 错误
 // 作为聚合错误。任一阶段审计写失败 → 立即返回，action 不执行。
 func (j *JSONL) CommitMoves(intents []MoveIntent, action func() []error) error {
+	return j.commitMoves(intents, action, nil)
+}
+
+// CommitMovesFiltering 带聚合判据的批量事务：per-file result 落盘不变
+// （真实错误全部记录，fail-closed），仅聚合错误跳过被 ignore 判定为
+// 「不计为失败」的错误（如 ENOENT already-gone 竞态）。ignore 为 nil
+// 时等价 CommitMoves。
+func (j *JSONL) CommitMovesFiltering(intents []MoveIntent, action func() []error, ignore func(error) bool) error {
+	return j.commitMoves(intents, action, ignore)
+}
+
+func (j *JSONL) commitMoves(intents []MoveIntent, action func() []error, ignore func(error) bool) error {
 	if len(intents) == 0 {
 		return nil
 	}
@@ -102,9 +114,13 @@ func (j *JSONL) CommitMoves(intents []MoveIntent, action func() []error) error {
 		return fmt.Errorf("audit: persist results: %w", err)
 	}
 	for _, e := range perFile {
-		if e != nil {
-			return e
+		if e == nil {
+			continue
 		}
+		if ignore != nil && ignore(e) {
+			continue // 不计为失败的错误（result 已如实落盘）
+		}
+		return e
 	}
 	return nil
 }

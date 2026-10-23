@@ -32,12 +32,18 @@ func TestMoveBatchBucketPartialFailurePhysicalCount(t *testing.T) {
 		{Src: filepath.Join(root, "a/gone.txt"), Rel: "a/gone.txt"}, // 扫描后消失 → 物理失败
 		{Src: src2, Rel: "a/f2.txt"},
 	}
-	okCount, err := m.MoveBatchBucket("r1", "p1", "2026-10-15.run-1", reqs, Recheck{})
-	if err == nil {
-		t.Fatal("partial failure must surface an aggregate error")
+	okCount, goneCount, err := m.MoveBatchBucket("r1", "p1", "2026-10-15.run-1", reqs, Recheck{})
+	if err != nil {
+		// 2026-10-23 ENOENT 分流后：批内唯一失败是 gone.txt 的 ENOENT（良性），
+		// 聚合错误不再包含 already-gone——原断言「must surface aggregate error」
+		// 随分流语义作废。
+		t.Fatalf("ENOENT-only failure is already_gone, not aggregate error: %v", err)
 	}
 	if okCount != 2 {
 		t.Fatalf("physical ok count = %d, want 2 (physical, not enqueue, semantics)", okCount)
+	}
+	if goneCount != 1 {
+		t.Fatalf("already_gone = %d, want 1", goneCount)
 	}
 
 	// 物理：2 个文件在桶内，src 消失；失败者 src 本就不存在。

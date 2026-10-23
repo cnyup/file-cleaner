@@ -8,7 +8,9 @@
 package trash
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -52,17 +54,26 @@ func (l *Layout) PurgingDir() string {
 	return filepath.Join(l.root, l.trashName, PurgingDirName)
 }
 
+// isAlreadyGone 判定错误是否为「文件扫描后已被他人删走」（ENOENT 家族）。
+// NFS 上 rename 可能返回裸 ENOENT 或包裹后的 *PathError——errors.Is 两者皆覆盖。
+func isAlreadyGone(err error) bool {
+	return err != nil && errors.Is(err, fs.ErrNotExist)
+}
+
 // MoveBatchBucket 分桶版批量移动：目标为桶内路径。
-// 返回批内物理成功数与聚合错误（首个非 nil）。
-func (m *Mover) MoveBatchBucket(runID, policyID, bucket string, reqs []MoveReq, rc Recheck) (int, error) {
+// 返回（物理成功数, already_gone 数, 聚合错误）。already_gone = rename/
+// recheck 阶段 ENOENT——文件在扫描后、移动前被业务侧删走，属良性竞态
+// （生产实测 2026-10-16：14911 失败全为 ENOENT），不计入 move_errors、
+// 不构成聚合错误。真失败（EACCES 等）仍进聚合错误。
+func (m *Mover) MoveBatchBucket(runID, policyID, bucket string, reqs []MoveReq, rc Recheck) (int, int, error) {
 	if len(reqs) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	intents := make([]audit.MoveIntent, len(reqs))
 	for i, r := range reqs {
 		clean := filepath.Clean(r.Rel)
 		if filepath.IsAbs(clean) || clean == ".." || len(clean) >= 3 && clean[:3] == ".." + string(filepath.Separator) {
-			return 0, fmt.Errorf("trash: rel %q escapes root", r.Rel)
+			return 0, 0, fmt.Errorf("trash: rel %q escapes root", r.Rel)
 		}
 		ino := r.ScanInode
 		if ino == 0 {
@@ -73,8 +84,8 @@ func (m *Mover) MoveBatchBucket(runID, policyID, bucket string, reqs []MoveReq, 
 			Src: r.Src, Trash: m.layout.BucketPath(bucket, r.Rel), Inode: ino,
 		}
 	}
-	okCount := 0
-	err := m.audit.CommitMoves(intents, func() []error {
+	okCount, goneCount := 0, 0
+	err := m.audit.CommitMovesFiltering(intents, func() []error {
 		var wg sync.WaitGroup
 		errs := make([]error, len(reqs))
 		for i, r := range reqs {
@@ -89,10 +100,10 @@ func (m *Mover) MoveBatchBucket(runID, policyID, bucket string, reqs []MoveReq, 
 			}(i, r)
 		}
 		wg.Wait()
-		okCount = countNil(errs)
+		okCount, goneCount = countOutcome(errs)
 		return errs
-	})
-	return okCount, err
+	}, isAlreadyGone)
+	return okCount, goneCount, err
 }
 
 // Retire 整桶退休：rename 进 .retired（O(1)）。桶内文件保持原样等待后台

@@ -39,7 +39,7 @@ func TestMovePreservesStructure(t *testing.T) {
 	defer jl.Close()
 	m := NewMover(layout, jl)
 
-	if _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "a/b/f.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "a/b/f.txt"}}, Recheck{}); err != nil {
 		t.Fatalf("MoveBatch: %v", err)
 	}
 
@@ -63,7 +63,7 @@ func TestMovePathTraversalBlocked(t *testing.T) {
 	m := NewMover(layout, jl)
 
 	// rel 含 ..，必须拒绝
-	_, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: filepath.Join(root, "f"), Rel: "../escape"}}, Recheck{})
+	_, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: filepath.Join(root, "f"), Rel: "../escape"}}, Recheck{})
 	if err == nil {
 		t.Fatal("path traversal must be rejected")
 	}
@@ -77,11 +77,11 @@ func TestSameNameSecondMove(t *testing.T) {
 
 	src := filepath.Join(root, "f.txt")
 	mustWrite(t, src, "v1")
-	if _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	mustWrite(t, src, "v2")
-	if _, err := m.MoveBatch("r2", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r2", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	// 两个版本都在回收站
@@ -120,7 +120,7 @@ func TestRecheckChangedSkips(t *testing.T) {
 	// recheck 声称旧 mtime，但文件实际被更新 → 必须跳过
 	newer := time.Now().Add(time.Hour)
 	os.Chtimes(src, newer, newer)
-	_, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{Mtime: old})
+	_, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{Mtime: old})
 	if err == nil {
 		t.Fatal("changed file must be skipped")
 	}
@@ -137,7 +137,7 @@ func TestRestoreNoOverwrite(t *testing.T) {
 
 	src := filepath.Join(root, "f.txt")
 	mustWrite(t, src, "old")
-	if _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "f.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	// 原路径出现新文件
@@ -164,7 +164,7 @@ func TestRestoreOK(t *testing.T) {
 
 	src := filepath.Join(root, "a/f.txt")
 	mustWrite(t, src, "data")
-	_, _ = m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "a/f.txt"}}, Recheck{})
+	_, _, _ = m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "a/f.txt"}}, Recheck{})
 	if err := m.Restore("r2", "p1", "a/f.txt"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestPurgeOnlyKnownExpired(t *testing.T) {
 	// 已知条目：先移入（较早）
 	src1 := filepath.Join(root, "old.txt")
 	mustWrite(t, src1, "x")
-	_, _ = m.MoveBatch("r1", "p1", []MoveReq{{Src: src1, Rel: "old.txt"}}, Recheck{})
+	_, _, _ = m.MoveBatch("r1", "p1", []MoveReq{{Src: src1, Rel: "old.txt"}}, Recheck{})
 
 	// 未知条目：手工放进回收站（DB 无记录）→ 不可删
 	mustWrite(t, layout.TrashPath("unknown.txt"), "y")
@@ -199,7 +199,7 @@ func TestPurgeOnlyKnownExpired(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	src2 := filepath.Join(root, "fresh.txt")
 	mustWrite(t, src2, "z")
-	_, _ = m.MoveBatch("r2", "p1", []MoveReq{{Src: src2, Rel: "fresh.txt"}}, Recheck{})
+	_, _, _ = m.MoveBatch("r2", "p1", []MoveReq{{Src: src2, Rel: "fresh.txt"}}, Recheck{})
 
 	// expiry 取两者入站时间的中点：old 过期、fresh 未过期（先刷新投影）
 	if _, err := st.ImportJSONL(jsonlPath); err != nil {

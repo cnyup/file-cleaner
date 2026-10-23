@@ -112,10 +112,12 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 	})
 
 	// move 批量缓冲：凑批走审计事务。
-	// physMoved/physFailed 是物理口径计数（P0-2）：OnMove 入队成功 ≠
+	// physMoved/physFailed/physGone 是物理口径计数（P0-2）：OnMove 入队成功 ≠
 	// 物理移动成功，批事务的真实结果才是真相——尾批（P0-3）与凑批
 	// 轮转批的每文件成败都计入这里，不再有被 _ = flush() 吞掉的批。
-	var physMoved, physFailed atomic.Int64
+	// physGone = already_gone（ENOENT 分流，2026-10-23）：扫描后、移动前
+	// 被业务侧删走的文件，良性竞态，不进 move_errors。
+	var physMoved, physFailed, physGone atomic.Int64
 	var mu sync.Mutex
 	var pending []trash.MoveReq
 	flush := func() error {
@@ -126,9 +128,10 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		if len(batch) == 0 || dryRun {
 			return nil
 		}
-		okN, err := mover.MoveBatchBucket(runID, p.ID, bucket, batch, trash.Recheck{})
+		okN, goneN, err := mover.MoveBatchBucket(runID, p.ID, bucket, batch, trash.Recheck{})
 		physMoved.Add(int64(okN))
-		physFailed.Add(int64(len(batch) - okN))
+		physGone.Add(int64(goneN))
+		physFailed.Add(int64(len(batch) - okN - goneN))
 		return err
 	}
 
@@ -165,10 +168,12 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 
 	// 物理口径覆盖（P0-2）：dry-run 时 flush 是 no-op（physMoved=0），
 	// 保留 pipeline 的 matched 口径；真删时以批事务结果为准——
-	// moved=物理成功数，move_errors=物理失败数。
+	// moved=物理成功数，move_errors=物理失败数（already_gone 不计入，
+	// 单列 already_gone 供观察业务侧竞态规模）。
 	if !dryRun {
 		stats.MovedOK = physMoved.Load()
 		stats.MoveErrors = physFailed.Load()
+		stats.AlreadyGone = physGone.Load()
 	}
 
 	// 空目录尾扫（empty_dirs.enabled 时）：文件移动完成后执行，本轮
@@ -241,6 +246,7 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 	totals := map[string]int64{
 		"files": stats.Files, "matched": stats.Matched,
 		"moved": stats.MovedOK, "move_errors": stats.MoveErrors, "errors": stats.Errors,
+		"already_gone": stats.AlreadyGone,
 		"empty_dirs_candidates": stats.EmptyDirsCandidates, "empty_dirs_removed": stats.EmptyDirsRemoved,
 		"empty_dirs_skipped": stats.EmptyDirsSkipped, "empty_dirs_errors": stats.EmptyDirsErrors,
 	}

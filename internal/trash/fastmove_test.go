@@ -27,7 +27,7 @@ func TestMoveUsesScanMetaNoSrcLstat(t *testing.T) {
 	ino = inodeOf(t, src)
 
 	// 场景1：快照 inode 正确 → 移动成功（不依赖 moveOne 内部再 Lstat）
-	_, err := m.MoveBatch("r1", "p1", []MoveReq{{
+	_, _, err := m.MoveBatch("r1", "p1", []MoveReq{{
 		Src: src, Rel: "f.txt",
 		ScanInode: ino, ScanMtime: st.ModTime(),
 	}}, Recheck{})
@@ -43,7 +43,7 @@ func TestMoveUsesScanMetaNoSrcLstat(t *testing.T) {
 	mustWrite(t, src2, "v2")
 	st2, _ := os.Lstat(src2)
 	bogus := inodeOf(t, src2) + 999999
-	_, err = m.MoveBatch("r2", "p1", []MoveReq{{
+	_, _, err = m.MoveBatch("r2", "p1", []MoveReq{{
 		Src: src2, Rel: "g.txt",
 		ScanInode: bogus, ScanMtime: st2.ModTime(),
 	}}, Recheck{})
@@ -65,7 +65,7 @@ func TestMoveNoSnapshotKeepsOldRecheck(t *testing.T) {
 
 	src := filepath.Join(root, "h.txt")
 	mustWrite(t, src, "keep")
-	if _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "h.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "h.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(layout.TrashPath("h.txt")); err != nil {
@@ -97,11 +97,11 @@ func TestMoveResultRecordsActualTrashPath(t *testing.T) {
 	// 冲突检测生效）——行为级断言：两次都在盘上可寻回
 	src := filepath.Join(root, "dup.txt")
 	mustWrite(t, src, "v1")
-	if _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "dup.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r1", "p1", []MoveReq{{Src: src, Rel: "dup.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	mustWrite(t, src, "v2")
-	if _, err := m.MoveBatch("r2", "p1", []MoveReq{{Src: src, Rel: "dup.txt"}}, Recheck{}); err != nil {
+	if _, _, err := m.MoveBatch("r2", "p1", []MoveReq{{Src: src, Rel: "dup.txt"}}, Recheck{}); err != nil {
 		t.Fatal(err)
 	}
 	// v1 与 v2 都必须存在于回收站（不同名或同目录不同条目）

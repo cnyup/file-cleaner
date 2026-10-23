@@ -34,6 +34,9 @@ type RunStats struct {
 	Matched       int64
 	MovedOK       int64
 	MoveErrors    int64
+	// AlreadyGone = already_gone（ENOENT 分流）：扫描后、移动前被业务侧
+	// 删走的文件数。真删时由 runner 以批事务结果覆盖；不计入 MoveErrors。
+	AlreadyGone  int64
 	ScanElapsed   time.Duration
 	DrainElapsed  time.Duration
 	TotalElapsed  time.Duration

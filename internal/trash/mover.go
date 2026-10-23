@@ -103,16 +103,17 @@ func NewMover(layout *Layout, jl *audit.JSONL) *Mover {
 func (m *Mover) SetStore(st *audit.Store) { m.store = st }
 
 // MoveBatch 批量移动（intent → rename → result 事务）。
-// 返回批内物理成功数与聚合错误（首个非 nil）。
-func (m *Mover) MoveBatch(runID, policyID string, reqs []MoveReq, rc Recheck) (int, error) {
+// 返回（物理成功数, already_gone 数, 聚合错误）——already_gone 语义见
+// MoveBatchBucket。
+func (m *Mover) MoveBatch(runID, policyID string, reqs []MoveReq, rc Recheck) (int, int, error) {
 	if len(reqs) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	intents := make([]audit.MoveIntent, len(reqs))
 	for i, r := range reqs {
 		clean := filepath.Clean(r.Rel)
 		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
-			return 0, fmt.Errorf("trash: rel %q escapes root", r.Rel)
+			return 0, 0, fmt.Errorf("trash: rel %q escapes root", r.Rel)
 		}
 		// inode 优先取扫描快照（零 RPC）；未携带才 Lstat（手动路径兼容）。
 		ino := r.ScanInode
@@ -122,8 +123,8 @@ func (m *Mover) MoveBatch(runID, policyID string, reqs []MoveReq, rc Recheck) (i
 		intents[i] = audit.MoveIntent{RunID: runID, PolicyID: policyID, Src: r.Src, Trash: m.layout.TrashPath(r.Rel), Inode: ino}
 	}
 
-	okCount := 0
-	err := m.audit.CommitMoves(intents, func() []error {
+	okCount, goneCount := 0, 0
+	err := m.audit.CommitMovesFiltering(intents, func() []error {
 		// 批内并发 rename（受 moveSem 约束；未启用时退化为串行）。
 		// 审计事务语义不变：intent 已全部落盘，本批全部 rename 完成后才写 result。
 		var wg sync.WaitGroup
@@ -140,21 +141,24 @@ func (m *Mover) MoveBatch(runID, policyID string, reqs []MoveReq, rc Recheck) (i
 			}(i, r)
 		}
 		wg.Wait()
-		okCount = countNil(errs)
+		okCount, goneCount = countOutcome(errs)
 		return errs
-	})
-	return okCount, err
+	}, isAlreadyGone)
+	return okCount, goneCount, err
 }
 
-// countNil 统计 nil 元素个数（物理成功数）。
-func countNil(errs []error) int {
-	n := 0
+// countOutcome 统计批结果：物理成功数与 already_gone 数（ENOENT 家族）。
+// 语义见 MoveBatchBucket 的 already_gone 注释。
+func countOutcome(errs []error) (ok, gone int) {
 	for _, e := range errs {
-		if e == nil {
-			n++
+		switch {
+		case e == nil:
+			ok++
+		case isAlreadyGone(e):
+			gone++
 		}
 	}
-	return n
+	return ok, gone
 }
 
 // moveOne 扁平布局移动（兼容路径）；分桶布局走 bucket.go 的 moveOneTo。
