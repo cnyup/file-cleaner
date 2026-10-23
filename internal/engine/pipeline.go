@@ -42,10 +42,12 @@ type RunStats struct {
 	TotalElapsed  time.Duration
 	// EmptyDirs* 由 runner 尾扫填充（empty_dirs.enabled 时）：
 	// Removed/Skipped/Errors 为物理口径（dry-run 时 Removed=候选计数）。
+	// EmptyDirsElapsed 由 runner 尾扫计时（禁用时为 0）。
 	EmptyDirsCandidates int64
 	EmptyDirsRemoved    int64
 	EmptyDirsSkipped    int64
 	EmptyDirsErrors     int64
+	EmptyDirsElapsed    time.Duration
 }
 
 // moveTask 命中条目（相对路径 + 元数据快照，full 含 inode 供核验）。

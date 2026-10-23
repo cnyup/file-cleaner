@@ -174,6 +174,17 @@ func TestRunOnceEmptyDirsAuditTrail(t *testing.T) {
 				if _, ok := tot["totals"].(map[string]any)["empty_dirs_removed"]; ok {
 					finishedWithEmpty++
 				}
+				// 时长可观测性（2026-10-23）：分阶段时长必须落盘，否则
+				// 生产 4h46m 轮无法归因（scan/drain/total/empty_dirs_ms）。
+				if _, ok := tot["totals"].(map[string]any)["scan_ms"]; !ok {
+					t.Fatal("run_finished totals missing scan_ms")
+				}
+				if _, ok := tot["totals"].(map[string]any)["total_ms"]; !ok {
+					t.Fatal("run_finished totals missing total_ms")
+				}
+				if _, ok := tot["totals"].(map[string]any)["empty_dirs_ms"]; !ok {
+					t.Fatal("run_finished totals missing empty_dirs_ms")
+				}
 			}
 		}
 	}

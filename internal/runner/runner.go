@@ -190,6 +190,7 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		}
 		var rmdirBatch []audit.RmdirIntent
 		var rbMu sync.Mutex
+		emptyStart := time.Now()
 		estats, err := nfs.SweepEmptyDirs(p.Root, nfs.EmptyDirsOptions{
 			AgeGate:   gate,
 			Exclude:   exclude,
@@ -230,6 +231,9 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 			jl.RunFinished(runID, p.ID, map[string]int64{"empty_dirs_error": 1})
 			return stats, fmt.Errorf("policy %q: empty_dirs sweep: %w", p.ID, err)
 		}
+		// 尾扫独立计时（与主扫描分开）：生产 4h46m 轮中 empty_dirs 阶段
+		// 无法归因的缺口主要嫌疑——单独落盘后可拆解。
+		stats.EmptyDirsElapsed = time.Since(emptyStart)
 	}
 
 	var agg map[string]int64
@@ -247,6 +251,8 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		"files": stats.Files, "matched": stats.Matched,
 		"moved": stats.MovedOK, "move_errors": stats.MoveErrors, "errors": stats.Errors,
 		"already_gone": stats.AlreadyGone,
+		"scan_ms": stats.ScanElapsed.Milliseconds(), "drain_ms": stats.DrainElapsed.Milliseconds(),
+		"total_ms": stats.TotalElapsed.Milliseconds(), "empty_dirs_ms": stats.EmptyDirsElapsed.Milliseconds(),
 		"empty_dirs_candidates": stats.EmptyDirsCandidates, "empty_dirs_removed": stats.EmptyDirsRemoved,
 		"empty_dirs_skipped": stats.EmptyDirsSkipped, "empty_dirs_errors": stats.EmptyDirsErrors,
 	}
