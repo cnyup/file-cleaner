@@ -73,6 +73,16 @@ sequenceDiagram
 
 同一时刻到期的多策略按 `max_concurrent_runs`（缺省 2，=1 即完全串行）并行执行；同策略仍由 flock 严格串行（上一轮未完成，本轮跳过）。
 
+## run_finished 指标怎么读
+
+每轮结束落一条 `run_finished` 审计事件，各计数口径：
+
+| 键 | 含义 |
+|---|---|
+| `moved` / `move_errors` | 物理移动结果（批事务真相，非入队计数）。`move_errors` 只计**真**失败（EACCES 等）——非零即需人工关注。 |
+| `already_gone` | 扫描后、移动前被业务侧删走的文件（ENOENT）。良性竞态非失败；不进 `move_errors`，但 per-file 审计 result 仍记 `ok:false`（restore 投影 fail-closed）。 |
+| `scan_ms` / `drain_ms` / `total_ms` / `empty_dirs_ms` | 分阶段耗时：扫描+判定 / 移动排空 / 全程 / 空目录尾扫（第二次全树走）——用于长轮次归因。 |
+
 ```mermaid
 flowchart TB
     subgraph daemon[filecleaner daemon]

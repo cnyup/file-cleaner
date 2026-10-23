@@ -90,6 +90,16 @@ flowchart LR
 - **The audit log is the source of truth.** The SQLite store is a rebuildable projection (`audit rebuild` reconstructs it from JSONL). Restore queries the projection; pruning respects the invariant that audit shards always outlive trash retention.
 - **Daemon = three independent schedules.** Per-policy `schedule` (clean), `purge_schedule` (retire), and an hourly sweeper (physical delete). Same-policy operations serialize via flock; an unfinished run causes the next trigger to skip. Policies triggered at the same moment run in parallel up to `max_concurrent_runs` (default 2, `1` = fully serial).
 
+## Reading run_finished metrics
+
+Each run emits a `run_finished` audit event. What the counters mean:
+
+| Key | Meaning |
+|---|---|
+| `moved` / `move_errors` | Physical move results (batch-transaction truth, not enqueue counts). `move_errors` counts **real** failures only (EACCES, …) — non-zero deserves human attention. |
+| `already_gone` | Files deleted by the business side between scan and move (ENOENT). Benign race, not a failure; excluded from `move_errors` but the per-file audit result still records `ok:false` (fail-closed for restore projection). |
+| `scan_ms` / `drain_ms` / `total_ms` / `empty_dirs_ms` | Per-stage wall time: scan+match, move drain, whole run, and the empty-dirs tail sweep (a second tree walk) — for attributing long runs. |
+
 ## Audit transaction protocol (the crash-safety core)
 
 ```mermaid

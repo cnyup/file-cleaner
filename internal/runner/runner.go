@@ -190,6 +190,7 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		}
 		var rmdirBatch []audit.RmdirIntent
 		var rbMu sync.Mutex
+		auditWriteErr := false // rmdir 尾批审计事务写失败（见下 P2）
 		emptyStart := time.Now()
 		estats, err := nfs.SweepEmptyDirs(p.Root, nfs.EmptyDirsOptions{
 			AgeGate:   gate,
@@ -219,13 +220,21 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 					perDir[i] = fmt.Errorf("still exists after sweep")
 				}
 			}
-			_ = jl.CommitRmdirs(rmdirBatch, func() []error { return perDir })
+			if rerr := jl.CommitRmdirs(rmdirBatch, func() []error { return perDir }); rerr != nil {
+				// 审计尾批写失败不静默（P2）：物理删除已完成（先删后记），
+				// 丢的是审计记录——计入 empty_dirs_errors 让指标可见，
+				// restore 投影 rebuild 可从残余分片恢复。
+				auditWriteErr = true
+			}
 		}
 		if estats != nil {
 			stats.EmptyDirsCandidates = estats.Candidates
 			stats.EmptyDirsRemoved = estats.Removed
 			stats.EmptyDirsSkipped = estats.Skipped
 			stats.EmptyDirsErrors = estats.Errors
+		}
+		if auditWriteErr {
+			stats.EmptyDirsErrors++
 		}
 		if err != nil {
 			jl.RunFinished(runID, p.ID, map[string]int64{"empty_dirs_error": 1})
