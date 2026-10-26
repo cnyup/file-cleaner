@@ -10,6 +10,7 @@
 package scheduler
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,11 @@ import (
 
 	"github.com/robfig/cron/v3"
 )
+
+// ErrPolicyBusy 是「策略锁被上次未完成的 run 持有」的 sentinel。
+// 调用方用 errors.Is 判定是否值得等待重试（如 PurgeWithRetry）；
+// 非 busy 错误（mkdir/open 失败等）不重试。
+var ErrPolicyBusy = errors.New("policy busy (previous run in progress)")
 
 // Guard 是一把已获取的策略锁。
 type Guard struct {
@@ -37,7 +43,7 @@ func Acquire(stateDir, policyID string) (*Guard, error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("scheduler: policy %q busy (previous run in progress), skipping", policyID)
+		return nil, fmt.Errorf("scheduler: policy %q %w, skipping", policyID, ErrPolicyBusy)
 	}
 	return &Guard{f: f}, nil
 }

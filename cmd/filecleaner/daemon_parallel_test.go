@@ -81,7 +81,7 @@ func TestDaemonLoopParallelJobsDontSerialize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var out bytes.Buffer
-	daemonLoopWith(ctx, cfg, &out, runFn, func(*config.Policy) error { return nil })
+	daemonLoopWith(ctx, cfg, &out, runFn, func(_ context.Context, _ *config.Policy) error { return nil })
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -116,7 +116,7 @@ func TestJobNextAdvancedOnTrigger(t *testing.T) {
 	defer cancel()
 	var out bytes.Buffer
 	done := make(chan struct{})
-	go func() { daemonLoopWith(ctx, cfg, &out, runFn, func(*config.Policy) error { return nil }); close(done) }()
+	go func() { daemonLoopWith(ctx, cfg, &out, runFn, func(_ context.Context, _ *config.Policy) error { return nil }); close(done) }()
 
 	select {
 	case <-started:
@@ -168,7 +168,7 @@ func TestSemaphoreLimitsConcurrency(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			var out bytes.Buffer
-			daemonLoopWith(ctx, cfg, &out, runFn, func(*config.Policy) error { return nil })
+			daemonLoopWith(ctx, cfg, &out, runFn, func(_ context.Context, _ *config.Policy) error { return nil })
 
 			got := maxSeen.Load()
 			if tc.wantOverlap && got < 2 {
@@ -198,7 +198,7 @@ func TestShutdownWaitsForInflight(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var out bytes.Buffer
 	done := make(chan struct{})
-	go func() { daemonLoopWith(ctx, cfg, &out, runFn, func(*config.Policy) error { return nil }); close(done) }()
+	go func() { daemonLoopWith(ctx, cfg, &out, runFn, func(_ context.Context, _ *config.Policy) error { return nil }); close(done) }()
 
 	time.Sleep(100 * time.Millisecond) // 等 on-start 启动
 	cancel()

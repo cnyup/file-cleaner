@@ -70,14 +70,16 @@ func daemonLoop(ctx context.Context, cfg *config.Config, w io.Writer) {
 	daemonLoopWith(ctx, cfg, w, func(ctx context.Context, p *config.Policy) error {
 		_, err := runner.RunOnce(ctx, cfg, p, false)
 		return err
-	}, func(p *config.Policy) error {
-		_, err := runner.Purge(cfg, p)
+	}, func(ctx context.Context, p *config.Policy) error {
+		// busy-retry：purge 撞上仍在执行的主 run 时等待重试而非跳过
+		// （2026-10-26 巡检 P1 根治），interval/timeout 用 runner 默认。
+		_, err := runner.PurgeWithRetry(ctx, cfg, p, runner.PurgeRetryInterval)
 		return err
 	})
 }
 
 // daemonLoopWith 可注入版本：runFn/purgeFn 由调用方提供。
-func daemonLoopWith(ctx context.Context, cfg *config.Config, w io.Writer, runFn runJobFn, purgeFn func(*config.Policy) error) {
+func daemonLoopWith(ctx context.Context, cfg *config.Config, w io.Writer, runFn runJobFn, purgeFn func(ctx context.Context, p *config.Policy) error) {
 	jobs, err := buildJobs(cfg)
 	if err != nil {
 		fmt.Fprintf(w, "daemon: %v\n", err)
@@ -169,7 +171,7 @@ func daemonLoopWith(ctx context.Context, cfg *config.Config, w io.Writer, runFn 
 			runJob(j, func() error { return runFn(ctx, j.pol) }, "policy")
 		case jobPurge:
 			fmt.Fprintf(w, "daemon: purge policy %s\n", j.pol.ID)
-			runJob(j, func() error { return purgeFn(j.pol) }, "purge")
+			runJob(j, func() error { return purgeFn(ctx, j.pol) }, "purge")
 		}
 	}
 }

@@ -3,6 +3,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -391,6 +392,45 @@ func Purge(cfg *config.Config, p *config.Policy) ([]string, error) {
 	// sweep 不在此处同步执行：物理删除由 daemon 巡检（SweepLoop）或手动
 	// `filecleaner sweep` 异步完成——purge 命令毫秒级返回。
 	return retired, nil
+}
+
+// PurgeRetryInterval 与 PurgeRetryTimeout 是 PurgeWithRetry 的默认节奏：
+// 每次失败后 1 分钟重试，累计等待上限 4 小时。上限取值依据生产实况
+// （2026-10-26 巡检）：video 主 run 最长 ~3h（02:00 起跑 + empty_dirs
+// 尾扫最长拖到 04:58），4h 覆盖最坏情况且不至于让欠账拖过下一次调度。
+const (
+	PurgeRetryInterval = time.Minute
+	PurgeRetryTimeout  = 4 * time.Hour
+)
+
+// PurgeWithRetry 在策略锁被主 run 持有期间等待重试，直到拿到锁完成
+// purge、超时或 ctx 取消。修复生产缺陷（2026-10-26 巡检 P1）：
+// purge_schedule 到点撞上仍在执行的主 run 时，旧实现 busy-skip 后欠账
+// 只能等次日调度——video trash 曾因此连续 3 天不 retire，10-13 桶超期
+// 3 天。语义约束：
+//   - 只有 ErrPolicyBusy 才重试；其他错误（配置/IO）立即返回；
+//   - 重试节奏与上限固定（PurgeRetryInterval/Timeout），不吞真实错误；
+//   - ctx 取消时及时退出，daemon 停机不被 retry 拖住。
+func PurgeWithRetry(ctx context.Context, cfg *config.Config, p *config.Policy, interval time.Duration) ([]string, error) {
+	deadline := time.Now().Add(PurgeRetryTimeout)
+	for {
+		retired, err := Purge(cfg, p)
+		if err == nil {
+			return retired, nil
+		}
+		if !errors.Is(err, scheduler.ErrPolicyBusy) {
+			return retired, err // 非 busy：真实错误，立即返回
+		}
+		// busy：等待重试或退出
+		if time.Now().After(deadline) {
+			return retired, fmt.Errorf("policy %q: purge busy-retry timeout after %s: %w", p.ID, PurgeRetryTimeout, err)
+		}
+		select {
+		case <-ctx.Done():
+			return retired, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
 }
 
 // SweepLoop 周期巡检：物理删除全部策略的 .retired/.purging 桶。
