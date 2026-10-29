@@ -68,12 +68,18 @@ type Mover struct {
 	layout *Layout
 	audit  *audit.JSONL
 	store  *audit.Store // 可为 nil（测试模式：purge 退化为不删）
+	// policyID 用于 sweep_result 留痕事件归属（可空——纯 trash 层测试
+	// 不关心策略归属时保持零值）。
+	policyID string
 	// moveSem 限制批内并发 rename（NFS 元数据写并发）；nil = 串行（兼容旧行为）。
 	moveSem chan struct{}
 	// mkdirCache 已确认存在的回收站父目录（消除每文件 MkdirAll 的重复
 	// stat/mkdir RPC；继承旧工程验证过的优化）。
 	mkdirCache sync.Map
 }
+
+// SetPolicyID 设置 sweep_result 事件归属的策略 ID（runner.Sweep 调用）。
+func (m *Mover) SetPolicyID(id string) { m.policyID = id }
 
 // SetMoveConcurrency 启用批内并发 rename（workers<=0 不改变串行行为）。
 func (m *Mover) SetMoveConcurrency(workers int) {

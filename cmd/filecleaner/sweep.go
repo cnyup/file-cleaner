@@ -24,18 +24,20 @@ func runSweep(args []string) int {
 		fmt.Fprintf(os.Stderr, "sweep: %v\n", err)
 		return 1
 	}
-	total := 0
+	totalFiles := 0
+	totalDirs := 0
 	for i := range cfg.Policies {
 		if *policyID != "" && cfg.Policies[i].ID != *policyID {
 			continue
 		}
-		n, err := runner.Sweep(cfg, &cfg.Policies[i])
+		n, dn, err := runner.Sweep(cfg, &cfg.Policies[i])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sweep: policy %s: %v\n", cfg.Policies[i].ID, err)
 			return 1
 		}
-		total += n
+		totalFiles += n
+		totalDirs += dn
 	}
-	fmt.Printf("sweep: %d files physically deleted\n", total)
+	fmt.Printf("sweep: %d files, %d dirs physically deleted\n", totalFiles, totalDirs)
 	return 0
 }

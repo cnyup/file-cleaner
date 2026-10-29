@@ -20,12 +20,12 @@ func TestSweepRetiredBucket(t *testing.T) {
 	os.WriteFile(filepath.Join(retired, "a/b/f1"), []byte("x"), 0o644)
 	os.WriteFile(filepath.Join(retired, "f2"), []byte("x"), 0o644)
 
-	n, err := m.SweepOnce()
+	n, dn, err := m.SweepOnce()
 	if err != nil {
 		t.Fatalf("SweepOnce: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("swept = %d, want 2", n)
+	if n != 2 || dn != 3 { // 2 文件；3 目录（a, a/b, 桶根）
+		t.Fatalf("swept = %d files, %d dirs; want 2 files, 3 dirs", n, dn)
 	}
 	// 桶目录连同文件全部消失
 	if _, err := os.Stat(retired); !os.IsNotExist(err) {
@@ -45,12 +45,12 @@ func TestSweepCrashResume(t *testing.T) {
 	os.MkdirAll(filepath.Join(purging, "sub"), 0o755)
 	os.WriteFile(filepath.Join(purging, "sub", "f"), []byte("x"), 0o644)
 
-	n, err := m.SweepOnce()
+	n, dn, err := m.SweepOnce()
 	if err != nil {
 		t.Fatalf("SweepOnce (resume): %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("resumed swept = %d, want 1", n)
+	if n != 1 || dn != 2 { // 1 文件；2 目录（sub, 桶根）
+		t.Fatalf("resumed swept = %d files, %d dirs; want 1 file, 2 dirs", n, dn)
 	}
 	if _, err := os.Stat(purging); !os.IsNotExist(err) {
 		t.Fatal("purging bucket must be removed after resume")
@@ -69,7 +69,7 @@ func TestSweepIgnoresActive(t *testing.T) {
 	os.MkdirAll(active, 0o755)
 	os.WriteFile(filepath.Join(active, "f"), []byte("x"), 0o644)
 
-	n, err := m.SweepOnce()
+	n, _, err := m.SweepOnce()
 	if err != nil {
 		t.Fatal(err)
 	}

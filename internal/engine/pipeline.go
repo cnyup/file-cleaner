@@ -46,8 +46,13 @@ type RunStats struct {
 	EmptyDirsCandidates int64
 	EmptyDirsRemoved    int64
 	EmptyDirsSkipped    int64
-	EmptyDirsErrors     int64
-	EmptyDirsElapsed    time.Duration
+	// skip 原因分桶（2026-10-29 计划 T2）：NonEmpty=复查时目录非空/
+	// ENOTEMPTY；Young=mtime 未过年龄门。合计与 Skipped 一致（另有
+	// Gone 计入 Skipped 不单列进 run_finished——量级通常极小）。
+	EmptyDirsSkippedNonEmpty int64
+	EmptyDirsSkippedYoung    int64
+	EmptyDirsErrors          int64
+	EmptyDirsElapsed         time.Duration
 }
 
 // moveTask 命中条目（相对路径 + 元数据快照，full 含 inode 供核验）。

@@ -298,6 +298,20 @@ func (j *JSONL) CommitPurgeBatch(runID, policyID string, trashPaths []string, ac
 	return nil
 }
 
+// WriteSweepResult sweeper 物理删除轮留痕事件（trash 包调用）。
+// 与 intent/result 事务对不同：sweep 是"先删后记"的留痕（桶已 rename
+// 进 .purging 即崩溃可恢复），无对应 intent。不进入 FindOpenIntents
+// 与 restore 投影（store.go 查询不含此类型）。
+func (j *JSONL) WriteSweepResult(runID, policyID string, ok bool, errMsg string, files, dirs, durationMS int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.appendLocked([]Event{{
+		TS: nowUnixNano(), RunID: runID, PolicyID: policyID, Type: "sweep_result",
+		OK: okPtr(ok), Err: errMsg,
+		Extra: map[string]any{"files": files, "dirs": dirs, "duration_ms": durationMS},
+	}})
+}
+
 // Close 关闭审计文件。
 func (j *JSONL) Close() error {
 	j.mu.Lock()

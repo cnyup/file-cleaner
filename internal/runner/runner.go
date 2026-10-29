@@ -232,6 +232,8 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 			stats.EmptyDirsCandidates = estats.Candidates
 			stats.EmptyDirsRemoved = estats.Removed
 			stats.EmptyDirsSkipped = estats.Skipped
+			stats.EmptyDirsSkippedNonEmpty = estats.SkippedNonEmpty
+			stats.EmptyDirsSkippedYoung = estats.SkippedYoung
 			stats.EmptyDirsErrors = estats.Errors
 		}
 		if auditWriteErr {
@@ -265,6 +267,10 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		"total_ms": stats.TotalElapsed.Milliseconds(), "empty_dirs_ms": stats.EmptyDirsElapsed.Milliseconds(),
 		"empty_dirs_candidates": stats.EmptyDirsCandidates, "empty_dirs_removed": stats.EmptyDirsRemoved,
 		"empty_dirs_skipped": stats.EmptyDirsSkipped, "empty_dirs_errors": stats.EmptyDirsErrors,
+		// skip 原因分桶（2026-10-29 T2）：为 empty_dirs 降耗方向裁决提供
+		// 生产数据。skipped 合计保持向后兼容。
+		"empty_dirs_skipped_nonempty": stats.EmptyDirsSkippedNonEmpty,
+		"empty_dirs_skipped_young":    stats.EmptyDirsSkippedYoung,
 	}
 	jl.RunFinished(runID, p.ID, totals)
 	if err == nil {
@@ -435,6 +441,8 @@ func PurgeWithRetry(ctx context.Context, cfg *config.Config, p *config.Policy, i
 
 // SweepLoop 周期巡检：物理删除全部策略的 .retired/.purging 桶。
 // 由 daemon 以 goroutine 运行；每轮间隔 interval。
+// 日志无条件打（含 0,0）——"跑过且无事"与"没跑"必须可区分
+// （2026-10-29 巡检：骨架桶 files=0 曾使日志静默，桶消失无痕）。
 func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, log interface{ Write([]byte) (int, error) }) {
 	for {
 		if ctx.Err() != nil {
@@ -442,10 +450,12 @@ func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, 
 		}
 		for i := range cfg.Policies {
 			p := &cfg.Policies[i]
-			if n, err := Sweep(cfg, p); err != nil {
+			files, dirs, err := Sweep(cfg, p)
+			switch {
+			case err != nil:
 				fmt.Fprintf(log, "sweep: policy %s: %v\n", p.ID, err)
-			} else if n > 0 {
-				fmt.Fprintf(log, "sweep: policy %s: %d files physically deleted\n", p.ID, n)
+			default:
+				fmt.Fprintf(log, "sweep: policy %s: %d files, %d dirs physically deleted\n", p.ID, files, dirs)
 			}
 		}
 		select {
@@ -456,16 +466,17 @@ func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, 
 	}
 }
 
-// Sweep 单策略一轮物理删除。
-func Sweep(cfg *config.Config, p *config.Policy) (int, error) {
+// Sweep 单策略一轮物理删除。返回删除的文件数与目录数。
+func Sweep(cfg *config.Config, p *config.Policy) (int, int, error) {
 	jl, err := openAudit(cfg)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer jl.Close()
 	layout := trash.NewLayout(p.Root, trashDirName(p))
 	m := trash.NewMover(layout, jl)
 	m.SetMoveConcurrency(p.Concurrency.MoveWorkers)
+	m.SetPolicyID(p.ID)
 	return m.SweepOnce()
 }
 

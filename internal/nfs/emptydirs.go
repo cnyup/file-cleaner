@@ -56,8 +56,14 @@ type EmptyDirsOptions struct {
 type EmptyDirsStats struct {
 	Candidates int64 // 阶段一收集到的空目录候选数
 	Removed    int64 // 物理删除数
-	Skipped    int64 // 复查不过（非空/未超龄）跳过数
+	Skipped    int64 // 复查不过跳过总数（= NonEmpty + Young + Gone，向后兼容合计）
 	Errors     int64 // lstat/rmdir 错误数
+	// skip 原因分桶（2026-10-29 计划 T2）：两类 skip 混在一个计数器里
+	// 无法用生产数据裁决优化方向（mtime 前移只救 Young；NonEmpty 大头
+	// 则应走"只复查 moved 祖先"路线）——分开计数后一晚数据即见分晓。
+	SkippedNonEmpty int64 // 复查时目录已非空（业务回填/竞态）或 rmdir ENOTEMPTY
+	SkippedYoung    int64 // mtime 未过年龄门（目录近期有条目活动）
+	SkippedGone     int64 // 复查时目录已消失（ENOENT，他人已删）
 }
 
 // emptyDirCandidate 阶段一产物：空目录路径 + mtime 快照。
@@ -95,6 +101,7 @@ func SweepEmptyDirs(root string, opts EmptyDirsOptions) (*EmptyDirsStats, error)
 		if err != nil {
 			if os.IsNotExist(err) {
 				atomic.AddInt64(&stats.Skipped, 1)
+				atomic.AddInt64(&stats.SkippedGone, 1)
 				continue
 			}
 			atomic.AddInt64(&stats.Errors, 1)
@@ -102,12 +109,14 @@ func SweepEmptyDirs(root string, opts EmptyDirsOptions) (*EmptyDirsStats, error)
 		}
 		if len(entries) > 0 {
 			atomic.AddInt64(&stats.Skipped, 1)
+			atomic.AddInt64(&stats.SkippedNonEmpty, 1)
 			continue
 		}
 		// 复查二：年龄门（收集时刻的 mtime 快照；readdir 复查不刷 mtime，
 		// 但业务增删条目会刷——快照与复查共同覆盖竞态窗口）。
 		if c.mtime.After(cutoff) {
 			atomic.AddInt64(&stats.Skipped, 1)
+			atomic.AddInt64(&stats.SkippedYoung, 1)
 			continue
 		}
 
@@ -122,8 +131,14 @@ func SweepEmptyDirs(root string, opts EmptyDirsOptions) (*EmptyDirsStats, error)
 			}
 		}
 		if err := os.Remove(c.path); err != nil {
-			// ENOTEMPTY：复查后写入的极端竞态——按设计由内核兜底，计跳过。
+			// 复查后窗口内的竞态：ENOENT=他人已删（Gone）；
+			// ENOTEMPTY=复查后回填（NonEmpty）——按设计由内核兜底，计跳过。
 			atomic.AddInt64(&stats.Skipped, 1)
+			if os.IsNotExist(err) {
+				atomic.AddInt64(&stats.SkippedGone, 1)
+			} else {
+				atomic.AddInt64(&stats.SkippedNonEmpty, 1)
+			}
 			continue
 		}
 		atomic.AddInt64(&stats.Removed, 1)
