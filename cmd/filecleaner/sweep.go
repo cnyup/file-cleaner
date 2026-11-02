@@ -30,7 +30,7 @@ func runSweep(args []string) int {
 		if *policyID != "" && cfg.Policies[i].ID != *policyID {
 			continue
 		}
-		n, dn, err := runner.Sweep(cfg, &cfg.Policies[i])
+		n, dn, err := runner.Sweep(cfg, &cfg.Policies[i], nil) // 手动 sweep：前台已有逐策略结果行，心跳关闭
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sweep: policy %s: %v\n", cfg.Policies[i].ID, err)
 			return 1

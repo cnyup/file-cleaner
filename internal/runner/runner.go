@@ -452,7 +452,11 @@ func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, 
 		}
 		for i := range cfg.Policies {
 			p := &cfg.Policies[i]
-			files, dirs, err := Sweep(cfg, p)
+			files, dirs, err := Sweep(cfg, p, func(msg string) {
+				// 心跳行进 daemon 日志（SweepLoop 的 log 即 journal/stdout），
+				// 使长跑期间"删到哪了"可观测（2026-11-02 C2）。
+				fmt.Fprintln(log, msg)
+			})
 			switch {
 			case err != nil:
 				fmt.Fprintf(log, "sweep: policy %s: %v\n", p.ID, err)
@@ -469,7 +473,9 @@ func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, 
 }
 
 // Sweep 单策略一轮物理删除。返回删除的文件数与目录数。
-func Sweep(cfg *config.Config, p *config.Policy) (int, int, error) {
+// heartbeat 可为 nil（关闭心跳）；非 nil 时长删期间周期收到进度行
+// （daemon SweepLoop 注入 os.Stdout → journal）。
+func Sweep(cfg *config.Config, p *config.Policy, heartbeat func(string)) (int, int, error) {
 	jl, err := openAudit(cfg)
 	if err != nil {
 		return 0, 0, err
@@ -479,6 +485,7 @@ func Sweep(cfg *config.Config, p *config.Policy) (int, int, error) {
 	m := trash.NewMover(layout, jl)
 	m.SetMoveConcurrency(p.Concurrency.MoveWorkers)
 	m.SetPolicyID(p.ID)
+	m.SetHeartbeat(heartbeat)
 	return m.SweepOnce()
 }
 

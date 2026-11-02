@@ -76,7 +76,14 @@ type Mover struct {
 	// mkdirCache 已确认存在的回收站父目录（消除每文件 MkdirAll 的重复
 	// stat/mkdir RPC；继承旧工程验证过的优化）。
 	mkdirCache sync.Map
+	// heartbeat 进度回调（可选；nil = 关闭心跳，零开销）。
+	// SweepOnce 长删期间周期调用（2026-11-02 C2）。写 journal/stdout 由
+	// 调用方（runner.SweepLoop / cmd）注入，trash 层不直接依赖 io。
+	heartbeat func(string)
 }
+
+// SetHeartbeat 注入进度回调（nil = 关闭）。
+func (m *Mover) SetHeartbeat(f func(string)) { m.heartbeat = f }
 
 // SetPolicyID 设置 sweep_result 事件归属的策略 ID（runner.Sweep 调用）。
 func (m *Mover) SetPolicyID(id string) { m.policyID = id }
