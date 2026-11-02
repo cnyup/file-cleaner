@@ -185,6 +185,12 @@ func TestRunOnceEmptyDirsAuditTrail(t *testing.T) {
 				if _, ok := tot["totals"].(map[string]any)["empty_dirs_ms"]; !ok {
 					t.Fatal("run_finished totals missing empty_dirs_ms")
 				}
+				// 三桶直读（2026-11-02 遗留 C1）：gone 必须与 nonempty/young
+				// 同级导出——生产已连续三晚靠"候选−removed−skipped"减法
+				// 反推 gone 差额（11-01 1653 / 11-02 511），恒等式应机器可核。
+				if _, ok := tot["totals"].(map[string]any)["empty_dirs_skipped_gone"]; !ok {
+					t.Fatal("run_finished totals missing empty_dirs_skipped_gone")
+				}
 			}
 		}
 	}

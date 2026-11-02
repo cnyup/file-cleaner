@@ -234,6 +234,7 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 			stats.EmptyDirsSkipped = estats.Skipped
 			stats.EmptyDirsSkippedNonEmpty = estats.SkippedNonEmpty
 			stats.EmptyDirsSkippedYoung = estats.SkippedYoung
+			stats.EmptyDirsSkippedGone = estats.SkippedGone
 			stats.EmptyDirsErrors = estats.Errors
 		}
 		if auditWriteErr {
@@ -271,6 +272,7 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		// 生产数据。skipped 合计保持向后兼容。
 		"empty_dirs_skipped_nonempty": stats.EmptyDirsSkippedNonEmpty,
 		"empty_dirs_skipped_young":    stats.EmptyDirsSkippedYoung,
+		"empty_dirs_skipped_gone":     stats.EmptyDirsSkippedGone,
 	}
 	jl.RunFinished(runID, p.ID, totals)
 	if err == nil {

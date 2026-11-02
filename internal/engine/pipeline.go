@@ -47,10 +47,13 @@ type RunStats struct {
 	EmptyDirsRemoved    int64
 	EmptyDirsSkipped    int64
 	// skip 原因分桶（2026-10-29 计划 T2）：NonEmpty=复查时目录非空/
-	// ENOTEMPTY；Young=mtime 未过年龄门。合计与 Skipped 一致（另有
-	// Gone 计入 Skipped 不单列进 run_finished——量级通常极小）。
+	// ENOTEMPTY；Young=mtime 未过年龄门；Gone=复查时目录已消失
+	// （ENOENT）。三桶合计与 Skipped 一致——三桶齐出后恒等式
+	// skipped=nonempty+young+gone 可机器核验（2026-11-02 C1：此前
+	// gone 只能差额反推，生产 11-01/11-02 达千级/日，非"极小"）。
 	EmptyDirsSkippedNonEmpty int64
 	EmptyDirsSkippedYoung    int64
+	EmptyDirsSkippedGone     int64
 	EmptyDirsErrors          int64
 	EmptyDirsElapsed         time.Duration
 }
