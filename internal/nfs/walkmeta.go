@@ -30,51 +30,56 @@ type WalkOptions struct {
 	Exclude     map[string]bool   // 显式集合（与 ExcludeDirs 合并）
 }
 
-// lastWalkCounters 保存最近一次 WalkMeta 的目录/错误计数（单 run 内有效，
-// 仅在 WalkMeta 返回后读取）。
-var lastWalkCounters struct {
-	dirs, errors int64
-	// errSamples 前 8 条 scan 错误样本（2026-11-03 巡检观察①：errors=2
-	// 无逐条明细，事后无法归因）。mu 保护 append；容量封顶防 audit 膨胀。
-	errSamples []string
-	mu         sync.Mutex
+// WalkStats 一次 WalkMeta 的目录/错误计数与错误样本。per-walk 随返回值
+// 交付——不落包级全局：daemon 并行调度（max_concurrent_runs 缺省 2，
+// job 触发即起 goroutine）下，全局样本表会被并发 walk 互相清零/污染
+//（2026-11-03 N1 部署后发现的竞态，walkmeta_concurrent_test.go 复现）。
+type WalkStats struct {
+	Dirs  int64
+	Errs  int64
+	// ErrSamples scan 期前 8 条错误样本（"path: err"）。供 runner 写入
+	// run_finished——errors 计数有逐条归因，ENOENT race 与故障可区分
+	//（2026-11-03 巡检观察①）。
+	ErrSamples []string
 }
 
-// walkErrSample 记录一条 scan 错误样本（路径 + 错误），封顶 8 条。
-func walkErrSample(path string, err error) {
-	lastWalkCounters.mu.Lock()
-	defer lastWalkCounters.mu.Unlock()
-	if len(lastWalkCounters.errSamples) >= 8 {
+// errSampler per-walk 错误采样器：封顶 8 条（防 audit 膨胀），
+// mu 保护 dir/stat 池并发 append。
+type errSampler struct {
+	mu      sync.Mutex
+	samples []string
+}
+
+// add 记录一条 scan 错误样本（路径 + 错误），封顶 8 条。
+func (s *errSampler) add(path string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.samples) >= 8 {
 		return
 	}
-	lastWalkCounters.errSamples = append(lastWalkCounters.errSamples, path+": "+err.Error())
+	s.samples = append(s.samples, path+": "+err.Error())
 }
 
-// LastWalkErrorSamples 返回最近一次 WalkMeta 的错误样本（≤8 条）。
-// 供 runner 写入 run_finished extra——ENOENT race 噪声与真实故障可区分。
-func LastWalkErrorSamples() []string {
-	lastWalkCounters.mu.Lock()
-	defer lastWalkCounters.mu.Unlock()
-	out := make([]string, len(lastWalkCounters.errSamples))
-	copy(out, lastWalkCounters.errSamples)
+// snapshot 返回样本副本。在 WalkMeta 返回前调用——walk 已 join（dirWG/
+// statWG.Wait），锁拷贝是防御性冗余，保证返回值与内部状态彻底解耦。
+func (s *errSampler) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.samples) == 0 {
+		return nil
+	}
+	out := make([]string, len(s.samples))
+	copy(out, s.samples)
 	return out
-}
-
-// LastWalkCounters 返回最近一次 WalkMeta 的 (dirs, errors)。
-func LastWalkCounters() (int64, int64) {
-	return lastWalkCounters.dirs, lastWalkCounters.errors
 }
 
 // WalkMeta 遍历 root，对每个非常规目录条目（文件）回调 visit(rel, meta)。
 // rel 为相对 root 的斜杠路径。内部复用 ScanTree 的遍历协议，但携带
 // 完整元数据。回收站目录 DefaultTrashDir 恒被排除。
-func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel string, meta FileMetaFull)) error {
-	// N1：每轮清零样本（LastWalkCounters 同语义——只反映最近一次）。
-	lastWalkCounters.mu.Lock()
-	lastWalkCounters.errSamples = nil
-	lastWalkCounters.mu.Unlock()
+// 返回 per-walk 计数与错误样本（WalkStats）——并行调用互不干扰。
+func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel string, meta FileMetaFull)) (WalkStats, error) {
 	if _, err := os.Lstat(root); err != nil {
-		return err
+		return WalkStats{}, err
 	}
 	if opts.DirWorkers <= 0 {
 		opts.DirWorkers = 8
@@ -91,6 +96,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 	}
 
 	var dirs, errs int64
+	var sampler errSampler
 	// dirCh 携带 (绝对路径, 相对路径)；入队或内联二选一，pending 协议同 ScanTree。
 	type dirJob struct{ abs, rel string }
 	dirCh := make(chan dirJob, 128)
@@ -107,7 +113,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 		meta, err := fstatFull(t.dirfd, t.name)
 		if err != nil {
 			atomic.AddInt64(&errs, 1)
-			walkErrSample(t.rel, err) // N1：路径留痕（stat 失败点）
+			sampler.add(t.rel, err) // N1：路径留痕（stat 失败点）
 			return
 		}
 		if meta.Mode&0o170000 == 0o100000 { // S_IFREG
@@ -141,7 +147,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 		f, err := os.Open(dir)
 		if err != nil {
 			atomic.AddInt64(&errs, 1)
-			walkErrSample(rel, err) // N1：路径留痕（目录打开失败）
+			sampler.add(rel, err) // N1：路径留痕（目录打开失败）
 			return
 		}
 		defer f.Close()
@@ -187,7 +193,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 			}
 			if readErr != nil {
 				atomic.AddInt64(&errs, 1)
-				walkErrSample(rel, readErr) // N1：路径留痕（readdir 失败）
+				sampler.add(rel, readErr) // N1：路径留痕（readdir 失败）
 				return
 			}
 			if len(batch) == 0 {
@@ -218,9 +224,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 	close(statCh)
 	statWG.Wait()
 
-	lastWalkCounters.dirs = dirs
-	lastWalkCounters.errors = errs
-	return nil
+	return WalkStats{Dirs: dirs, Errs: errs, ErrSamples: sampler.snapshot()}, nil
 }
 
 // metaTask 元数据 stat 任务。

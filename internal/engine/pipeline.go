@@ -197,7 +197,7 @@ func (p *Pipeline) RunTree(ctx context.Context, root string, opts TreeOptions) (
 	}
 
 	scanStart := time.Now()
-	err = nfs.WalkMeta(ctx, root, nfs.WalkOptions{
+	walkStats, err := nfs.WalkMeta(ctx, root, nfs.WalkOptions{
 		DirWorkers:  p.opts.DirWorkers,
 		StatWorkers: p.opts.StatWorkers,
 		ExcludeDirs: append(opts.ExcludeDirs, nfs.DefaultTrashDir),
@@ -231,10 +231,10 @@ func (p *Pipeline) RunTree(ctx context.Context, root string, opts TreeOptions) (
 		}
 	})
 	stats.ScanElapsed = time.Since(scanStart)
-	stats.Dirs, stats.Errors = nfs.LastWalkCounters()
-	// N1（2026-11-03 巡检观察①）：scan 错误样本随 Stats 上浮，runner 写
-	// 入 run_finished——errors 计数有逐条归因，ENOENT race 与故障可区分。
-	stats.WalkErrSamples = nfs.LastWalkErrorSamples()
+	// 计数与样本 per-walk 随返回值交付（N1 竞态修复，2026-11-03）：daemon
+	// 并行调度下包级全局会被并发 walk 互相清零/污染——errors 归因不再失真。
+	stats.Dirs, stats.Errors = walkStats.Dirs, walkStats.Errs
+	stats.WalkErrSamples = walkStats.ErrSamples
 
 	close(moveCh)
 	drainStart := time.Now()
