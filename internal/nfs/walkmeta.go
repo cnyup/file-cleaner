@@ -34,6 +34,30 @@ type WalkOptions struct {
 // 仅在 WalkMeta 返回后读取）。
 var lastWalkCounters struct {
 	dirs, errors int64
+	// errSamples 前 8 条 scan 错误样本（2026-11-03 巡检观察①：errors=2
+	// 无逐条明细，事后无法归因）。mu 保护 append；容量封顶防 audit 膨胀。
+	errSamples []string
+	mu         sync.Mutex
+}
+
+// walkErrSample 记录一条 scan 错误样本（路径 + 错误），封顶 8 条。
+func walkErrSample(path string, err error) {
+	lastWalkCounters.mu.Lock()
+	defer lastWalkCounters.mu.Unlock()
+	if len(lastWalkCounters.errSamples) >= 8 {
+		return
+	}
+	lastWalkCounters.errSamples = append(lastWalkCounters.errSamples, path+": "+err.Error())
+}
+
+// LastWalkErrorSamples 返回最近一次 WalkMeta 的错误样本（≤8 条）。
+// 供 runner 写入 run_finished extra——ENOENT race 噪声与真实故障可区分。
+func LastWalkErrorSamples() []string {
+	lastWalkCounters.mu.Lock()
+	defer lastWalkCounters.mu.Unlock()
+	out := make([]string, len(lastWalkCounters.errSamples))
+	copy(out, lastWalkCounters.errSamples)
+	return out
 }
 
 // LastWalkCounters 返回最近一次 WalkMeta 的 (dirs, errors)。
@@ -45,6 +69,10 @@ func LastWalkCounters() (int64, int64) {
 // rel 为相对 root 的斜杠路径。内部复用 ScanTree 的遍历协议，但携带
 // 完整元数据。回收站目录 DefaultTrashDir 恒被排除。
 func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel string, meta FileMetaFull)) error {
+	// N1：每轮清零样本（LastWalkCounters 同语义——只反映最近一次）。
+	lastWalkCounters.mu.Lock()
+	lastWalkCounters.errSamples = nil
+	lastWalkCounters.mu.Unlock()
 	if _, err := os.Lstat(root); err != nil {
 		return err
 	}
@@ -79,6 +107,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 		meta, err := fstatFull(t.dirfd, t.name)
 		if err != nil {
 			atomic.AddInt64(&errs, 1)
+			walkErrSample(t.rel, err) // N1：路径留痕（stat 失败点）
 			return
 		}
 		if meta.Mode&0o170000 == 0o100000 { // S_IFREG
@@ -112,6 +141,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 		f, err := os.Open(dir)
 		if err != nil {
 			atomic.AddInt64(&errs, 1)
+			walkErrSample(rel, err) // N1：路径留痕（目录打开失败）
 			return
 		}
 		defer f.Close()
@@ -157,6 +187,7 @@ func WalkMeta(ctx context.Context, root string, opts WalkOptions, visit func(rel
 			}
 			if readErr != nil {
 				atomic.AddInt64(&errs, 1)
+				walkErrSample(rel, readErr) // N1：路径留痕（readdir 失败）
 				return
 			}
 			if len(batch) == 0 {

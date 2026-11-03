@@ -31,6 +31,8 @@ type RunStats struct {
 	Files         int64
 	Dirs          int64
 	Errors        int64
+	// WalkErrSamples scan 期前 8 条错误样本（路径+错误串；nil=无错误）。
+	WalkErrSamples []string
 	Matched       int64
 	MovedOK       int64
 	MoveErrors    int64
@@ -230,6 +232,9 @@ func (p *Pipeline) RunTree(ctx context.Context, root string, opts TreeOptions) (
 	})
 	stats.ScanElapsed = time.Since(scanStart)
 	stats.Dirs, stats.Errors = nfs.LastWalkCounters()
+	// N1（2026-11-03 巡检观察①）：scan 错误样本随 Stats 上浮，runner 写
+	// 入 run_finished——errors 计数有逐条归因，ENOENT race 与故障可区分。
+	stats.WalkErrSamples = nfs.LastWalkErrorSamples()
 
 	close(moveCh)
 	drainStart := time.Now()

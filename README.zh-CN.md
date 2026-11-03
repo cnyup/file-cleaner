@@ -82,6 +82,7 @@ sequenceDiagram
 | `moved` / `move_errors` | 物理移动结果（批事务真相，非入队计数）。`move_errors` 只计**真**失败（EACCES 等）——非零即需人工关注。 |
 | `already_gone` | 扫描后、移动前被业务侧删走的文件（ENOENT）。良性竞态非失败；不进 `move_errors`，但 per-file 审计 result 仍记 `ok:false`（restore 投影 fail-closed）。 |
 | `scan_ms` / `drain_ms` / `total_ms` / `empty_dirs_ms` | 分阶段耗时：扫描+判定 / 移动排空 / **仅覆盖扫描+排空（不含空目录尾扫）** / 空目录尾扫（第二次全树走）——用于长轮次归因。跨阶段算术请用 `run_finished.ts − run 起点`（起点 UnixNano 内嵌在 `run_id`）。 |
+| `errors` | 扫描期文件系统错误（无法 stat 的条目、无法读的目录）。>0 时同事件附带最多 8 条路径样本（`walk_err_samples`）——ENOENT 竞态噪声与真实故障可区分。 |
 | `empty_dirs_skipped_nonempty` / `empty_dirs_skipped_young` / `empty_dirs_skipped_gone` | 空目录尾扫 skip 原因分桶：复查时已非空（业务回填）vs mtime 未过年龄门 vs 复查时已消失（ENOENT）。`empty_dirs_skipped` 仍为合计（向后兼容）。 |
 
 ```mermaid

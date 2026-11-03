@@ -274,11 +274,21 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		"empty_dirs_skipped_young":    stats.EmptyDirsSkippedYoung,
 		"empty_dirs_skipped_gone":     stats.EmptyDirsSkippedGone,
 	}
-	jl.RunFinished(runID, p.ID, totals)
+	jl.RunFinished(runID, p.ID, totals, runFinishedExtra(*stats))
 	if err == nil {
 		err = tailErr
 	}
 	return stats, err
+}
+
+// runFinishedExtra 组装 run_finished 的可选 extra（N1，2026-11-03 观察①）：
+// scan 错误样本逐条留痕——errors 计数不再是无归因的黑数。无样本时返回
+// nil（不写键，事件形状与旧版一致）。
+func runFinishedExtra(stats engine.RunStats) map[string]any {
+	if len(stats.WalkErrSamples) == 0 {
+		return nil
+	}
+	return map[string]any{"walk_err_samples": stats.WalkErrSamples}
 }
 
 // Restore 恢复条目（桶语义）：从审计投影定位该文件当前所在的回收站路径

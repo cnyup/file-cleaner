@@ -189,12 +189,20 @@ func (j *JSONL) RunStarted(runID, policyID, policyHash string) {
 	}})
 }
 
-func (j *JSONL) RunFinished(runID, policyID string, totals map[string]int64) {
+func (j *JSONL) RunFinished(runID, policyID string, totals map[string]int64, extra ...map[string]any) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	e := map[string]any{"totals": totals}
+	// N1：可选 extra 并入 run_finished（如 walk_err_samples——scan 错误
+	// 逐条留痕，2026-11-03 巡检观察①）。旧调用方不传，行为不变。
+	for _, m := range extra {
+		for k, v := range m {
+			e[k] = v
+		}
+	}
 	_ = j.appendLocked([]Event{{
 		TS: nowUnixNano(), RunID: runID, PolicyID: policyID, Type: EventRunOff,
-		Extra: map[string]any{"totals": totals},
+		Extra: e,
 	}})
 }
 

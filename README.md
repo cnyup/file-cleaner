@@ -99,6 +99,7 @@ Each run emits a `run_finished` audit event. What the counters mean:
 | `moved` / `move_errors` | Physical move results (batch-transaction truth, not enqueue counts). `move_errors` counts **real** failures only (EACCES, …) — non-zero deserves human attention. |
 | `already_gone` | Files deleted by the business side between scan and move (ENOENT). Benign race, not a failure; excluded from `move_errors` but the per-file audit result still records `ok:false` (fail-closed for restore projection). |
 | `scan_ms` / `drain_ms` / `total_ms` / `empty_dirs_ms` | Per-stage wall time: scan+match, move drain, total **covering scan+drain only (excluding the empty-dirs tail sweep)**, and the empty-dirs tail sweep (a second tree walk) — for attributing long runs. For cross-stage arithmetic use `run_finished.ts − run start` (the UnixNano run start is embedded in `run_id`). |
+| `errors` | Scan-phase filesystem errors (unstatable entries, unreadable dirs). When > 0, up to 8 path samples are attached as `walk_err_samples` in the same event — ENOENT races vs. real faults are distinguishable. |
 | `empty_dirs_skipped_nonempty` / `empty_dirs_skipped_young` / `empty_dirs_skipped_gone` | Skip-reason buckets for the empty-dirs tail sweep: refilled/non-empty at recheck vs. below the mtime age gate vs. already gone (ENOENT). `empty_dirs_skipped` remains the total (backward compatible). |
 
 ## Audit transaction protocol (the crash-safety core)
