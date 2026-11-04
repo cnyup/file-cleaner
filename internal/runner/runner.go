@@ -451,29 +451,53 @@ func PurgeWithRetry(ctx context.Context, cfg *config.Config, p *config.Policy, i
 	}
 }
 
-// SweepLoop 周期巡检：物理删除全部策略的 .retired/.purging 桶。
-// 由 daemon 以 goroutine 运行；每轮间隔 interval。
+// sweepRoundWith 对全部策略并行执行一轮 sweep：每策略独立 goroutine，
+// 后位策略不再被前位长跑整段等位（2026-11-03 巡检继承项——video sweep
+// 22 分钟/2.5h 长跑期间 ocr 整轮等位静默）。安全性依据：
+//   - 各策略 trash 目录互不相交（root 互异 + 桶布局 <trash>/<date>.run-*），
+//     rename 状态机（.retired → .purging → 删除）无跨策略共享状态；
+//   - sweep 不持策略锁，与主 run 并发写审计分片是既有事实（O_APPEND
+//     逐行 + 分片按天），并行化只是把既有并发面从 sweep vs run 扩展到
+//     sweep vs sweep；
+//   - 心跳/日志行均带 policyID，交错输出可区分归属。
+//
+// sweepFn 是注入缝：生产传 Sweep 包装，测试传可控闭包（并行行为测试
+// 见 sweep_parallel_test.go）。返回时全部策略已完成（wg 收口）。
 // 日志无条件打（含 0,0）——"跑过且无事"与"没跑"必须可区分
 // （2026-10-29 巡检：骨架桶 files=0 曾使日志静默，桶消失无痕）。
-func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, log interface{ Write([]byte) (int, error) }) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		for i := range cfg.Policies {
-			p := &cfg.Policies[i]
-			files, dirs, err := Sweep(cfg, p, func(msg string) {
-				// 心跳行进 daemon 日志（SweepLoop 的 log 即 journal/stdout），
-				// 使长跑期间"删到哪了"可观测（2026-11-02 C2）。
-				fmt.Fprintln(log, msg)
-			})
+func sweepRoundWith(cfg *config.Config, sweepFn func(p *config.Policy) (int, int, error), log interface{ Write([]byte) (int, error) }) {
+	var wg sync.WaitGroup
+	for i := range cfg.Policies {
+		p := &cfg.Policies[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			files, dirs, err := sweepFn(p)
 			switch {
 			case err != nil:
 				fmt.Fprintf(log, "sweep: policy %s: %v\n", p.ID, err)
 			default:
 				fmt.Fprintf(log, "sweep: policy %s: %d files, %d dirs physically deleted\n", p.ID, files, dirs)
 			}
+		}()
+	}
+	wg.Wait()
+}
+
+// SweepLoop 周期巡检：物理删除全部策略的 .retired/.purging 桶。
+// 由 daemon 以 goroutine 运行；每轮间隔 interval。
+func SweepLoop(ctx context.Context, cfg *config.Config, interval time.Duration, log interface{ Write([]byte) (int, error) }) {
+	for {
+		if ctx.Err() != nil {
+			return
 		}
+		sweepRoundWith(cfg, func(p *config.Policy) (int, int, error) {
+			return Sweep(cfg, p, func(msg string) {
+				// 心跳行进 daemon 日志（SweepLoop 的 log 即 journal/stdout），
+				// 使长跑期间"删到哪了"可观测（2026-11-02 C2）。
+				fmt.Fprintln(log, msg)
+			})
+		}, log)
 		select {
 		case <-time.After(interval):
 		case <-ctx.Done():
