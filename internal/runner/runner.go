@@ -236,6 +236,8 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 			stats.EmptyDirsSkippedYoung = estats.SkippedYoung
 			stats.EmptyDirsSkippedGone = estats.SkippedGone
 			stats.EmptyDirsErrors = estats.Errors
+			stats.EmptyDirsCollectElapsed = estats.CollectElapsed
+			stats.EmptyDirsDeleteElapsed = estats.DeleteElapsed
 		}
 		if auditWriteErr {
 			stats.EmptyDirsErrors++
@@ -268,6 +270,9 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		"total_ms": stats.TotalElapsed.Milliseconds(), "empty_dirs_ms": stats.EmptyDirsElapsed.Milliseconds(),
 		"empty_dirs_candidates": stats.EmptyDirsCandidates, "empty_dirs_removed": stats.EmptyDirsRemoved,
 		"empty_dirs_skipped": stats.EmptyDirsSkipped, "empty_dirs_errors": stats.EmptyDirsErrors,
+		// 计时拆分（2026-11-09 速度分析 C）：裁决"扫还是删"是瓶颈。
+		"empty_dirs_collect_ms": stats.EmptyDirsCollectElapsed.Milliseconds(),
+		"empty_dirs_delete_ms":  stats.EmptyDirsDeleteElapsed.Milliseconds(),
 		// skip 原因分桶（2026-10-29 T2）：为 empty_dirs 降耗方向裁决提供
 		// 生产数据。skipped 合计保持向后兼容。
 		"empty_dirs_skipped_nonempty": stats.EmptyDirsSkippedNonEmpty,

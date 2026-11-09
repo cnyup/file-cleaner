@@ -185,6 +185,16 @@ func TestRunOnceEmptyDirsAuditTrail(t *testing.T) {
 				if _, ok := tot["totals"].(map[string]any)["empty_dirs_ms"]; !ok {
 					t.Fatal("run_finished totals missing empty_dirs_ms")
 				}
+				// 计时拆分（2026-11-09 速度分析 C）：empty_dirs_ms 是
+				// collect+sort+delete 的总和，无法裁决优化方向。拆出两段
+				// 才能回答"时间花在扫还是删"——A（并行删除）与 B（young
+				// 剪枝）的收益排序依赖这两个数。
+				if _, ok := tot["totals"].(map[string]any)["empty_dirs_collect_ms"]; !ok {
+					t.Fatal("run_finished totals missing empty_dirs_collect_ms")
+				}
+				if _, ok := tot["totals"].(map[string]any)["empty_dirs_delete_ms"]; !ok {
+					t.Fatal("run_finished totals missing empty_dirs_delete_ms")
+				}
 				// 三桶直读（2026-11-02 遗留 C1）：gone 必须与 nonempty/young
 				// 同级导出——生产已连续三晚靠"候选−removed−skipped"减法
 				// 反推 gone 差额（11-01 1653 / 11-02 511），恒等式应机器可核。

@@ -210,3 +210,44 @@ func TestSweepEmptyDirsRecheckBeforeDelete(t *testing.T) {
 		t.Fatalf("file lost: %v", err)
 	}
 }
+
+// TestSweepEmptyDirsTimingSplit 计时拆分不变量（2026-11-09 速度分析 C）：
+// CollectElapsed + DeleteElapsed 必须覆盖全部实际工作，两者都 >0 且
+// 各自不超过总耗时。生产靠这两个数裁决"并行删除 vs young 剪枝"的收益
+// 排序——若某段恒为 0，说明计时挂点漏了。
+func TestSweepEmptyDirsTimingSplit(t *testing.T) {
+	root := t.TempDir()
+	// 造三层嵌套空目录：collect 需要下钻，delete 需要按深度排序逐个删。
+	for _, rel := range []string{"a/b/c", "a/d", "e/f"} {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, p, 10*24*time.Hour)
+	}
+
+	start := time.Now()
+	stats, err := SweepEmptyDirs(root, EmptyDirsOptions{
+		AgeGate: 7 * 24 * time.Hour,
+		Exclude: map[string]bool{DefaultTrashDir: true},
+	})
+	total := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.CollectElapsed <= 0 {
+		t.Fatalf("CollectElapsed=%v want >0 (timing hook missing on collect phase)", stats.CollectElapsed)
+	}
+	if stats.DeleteElapsed <= 0 {
+		t.Fatalf("DeleteElapsed=%v want >0 (timing hook missing on delete phase)", stats.DeleteElapsed)
+	}
+	if sum := stats.CollectElapsed + stats.DeleteElapsed; sum > total {
+		t.Fatalf("collect+delete=%v exceeds wall clock %v — phases overlap or double-counted", sum, total)
+	}
+	if stats.Removed != 3 {
+		// 级联语义（emptydirs.go:29-31）：收集时即空的叶子连删；因本轮
+		// 删除才变空的父目录（a、a/b）不进本轮候选，留待下轮。故 5 个
+		// 目录里本轮只删 3 个叶子。
+		t.Fatalf("removed=%d want 3 (leaf dirs only; parents emptied this run survive)", stats.Removed)
+	}
+}

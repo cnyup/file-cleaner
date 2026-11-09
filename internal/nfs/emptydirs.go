@@ -64,6 +64,13 @@ type EmptyDirsStats struct {
 	SkippedNonEmpty int64 // 复查时目录已非空（业务回填/竞态）或 rmdir ENOTEMPTY
 	SkippedYoung    int64 // mtime 未过年龄门（目录近期有条目活动）
 	SkippedGone     int64 // 复查时目录已消失（ENOENT，他人已删）
+	// 计时拆分（2026-11-09 速度分析 C）：CollectElapsed = 阶段一并发遍历
+	// （含 lstat/readdir 全树走一遍）；DeleteElapsed = 排序 + 阶段二串行
+	// 复查与 rmdir。总时长是两者之和（调用方另计总）。拆分目的：裁决
+	// 优化方向——并行删除救 Delete，young 剪枝救 Collect，二者收益排序
+	// 必须靠实测，不能靠推断。
+	CollectElapsed time.Duration
+	DeleteElapsed  time.Duration
 }
 
 // emptyDirCandidate 阶段一产物：空目录路径 + mtime 快照。
@@ -78,10 +85,13 @@ func SweepEmptyDirs(root string, opts EmptyDirsOptions) (*EmptyDirsStats, error)
 	if opts.now == nil {
 		opts.now = time.Now
 	}
+	collectStart := time.Now()
 	cands, err := collectEmptyDirs(root, opts)
 	if err != nil {
 		return nil, err
 	}
+	collectElapsed := time.Since(collectStart)
+	deleteStart := time.Now()
 	stats := &EmptyDirsStats{Candidates: int64(len(cands))}
 
 	// 深度降序：子目录先删；同深度按路径排序保证确定性。
@@ -143,6 +153,8 @@ func SweepEmptyDirs(root string, opts EmptyDirsOptions) (*EmptyDirsStats, error)
 		}
 		atomic.AddInt64(&stats.Removed, 1)
 	}
+	stats.CollectElapsed = collectElapsed
+	stats.DeleteElapsed = time.Since(deleteStart)
 	return stats, nil
 }
 

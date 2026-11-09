@@ -58,6 +58,11 @@ type RunStats struct {
 	EmptyDirsSkippedGone     int64
 	EmptyDirsErrors          int64
 	EmptyDirsElapsed         time.Duration
+	// 计时拆分（2026-11-09 速度分析 C）：EmptyDirsElapsed 是 collect+sort+
+	// delete 的总和，无法裁决优化方向。拆出两段后：Collect 高 → young 剪枝
+	// （收集期按 mtime 过滤）收益大；Delete 高 → 并行删除收益大。
+	EmptyDirsCollectElapsed time.Duration
+	EmptyDirsDeleteElapsed  time.Duration
 }
 
 // moveTask 命中条目（相对路径 + 元数据快照，full 含 inode 供核验）。
