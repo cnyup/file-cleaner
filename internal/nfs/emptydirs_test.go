@@ -2,8 +2,10 @@ package nfs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -249,5 +251,93 @@ func TestSweepEmptyDirsTimingSplit(t *testing.T) {
 		// 删除才变空的父目录（a、a/b）不进本轮候选，留待下轮。故 5 个
 		// 目录里本轮只删 3 个叶子。
 		t.Fatalf("removed=%d want 3 (leaf dirs only; parents emptied this run survive)", stats.Removed)
+	}
+}
+
+// TestSweepEmptyDirsParallelDelete 阶段二并行删除（2026-11-10 速度分析 A）：
+// 生产实测 delete_ms 占 empty_dirs 总时长 97.5%（test: 121,292/130,343ms），
+// 瓶颈是逐个候选的 NFS 往返被串行执行。同深度目录互不为父子，可安全并行。
+//
+// 不变量：
+//  1. 同深度目录确实并行（并发度 >1）——串行实现红
+//  2. 父子顺序保持（级联语义不变：收集时即空的叶子连删）
+//  3. 非空目录仍被挡住（ENOTEMPTY 兜底不变）
+func TestSweepEmptyDirsParallelDelete(t *testing.T) {
+	root := t.TempDir()
+	// 40 个同深度叶子目录：足够观测到并发，又不至于让测试变慢。
+	var leaves []string
+	for i := 0; i < 40; i++ {
+		p := filepath.Join(root, "d", fmt.Sprintf("leaf%02d", i))
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, p, 10*24*time.Hour)
+		leaves = append(leaves, p)
+	}
+	// 注意：不给 d 本身 backdate——d 只含子目录不含文件，收集阶段同样会被
+	// 判为候选（empty 标志只在遇到文件时置 false）。若 d 也超龄，级联语义
+	// 会让它在本轮一并被删（removed=41）。这里让 d 保持年轻被年龄门挡住，
+	// 使断言聚焦在 40 个叶子的并发删除上。
+
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	stats, err := SweepEmptyDirs(root, EmptyDirsOptions{
+		AgeGate: 7 * 24 * time.Hour,
+		Exclude: map[string]bool{DefaultTrashDir: true},
+		OnRmdir: func(path string) error {
+			mu.Lock()
+			inFlight++
+			if inFlight > maxInFlight {
+				maxInFlight = inFlight
+			}
+			mu.Unlock()
+			// 模拟 NFS 往返延迟，让并发窗口真实可见。
+			time.Sleep(2 * time.Millisecond)
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Removed != 40 {
+		t.Fatalf("removed=%d want 40", stats.Removed)
+	}
+	if maxInFlight < 2 {
+		t.Fatalf("max concurrent OnRmdir=%d want >=2 — delete phase still serial", maxInFlight)
+	}
+	// 所有叶子必须真的被删掉。
+	for _, p := range leaves {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("leaf %s still exists (err=%v)", p, err)
+		}
+	}
+}
+
+// TestSweepEmptyDirsParallelKeepsParentOrder 并行不得破坏父子顺序：
+// 同深度并行、跨深度串行。这里构造 a/b/c 三层，验证父目录不会先于子目录
+// 被尝试删除（若顺序错，父目录会因非空而 ENOTEMPTY 跳过，removed 会少）。
+func TestSweepEmptyDirsParallelKeepsParentOrder(t *testing.T) {
+	root := t.TempDir()
+	// 3 层嵌套，每层 10 个：深度 3 的叶子先删，深度 2、1 依序。
+	for i := 0; i < 10; i++ {
+		p := filepath.Join(root, fmt.Sprintf("a%02d", i), "b", "c")
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, p, 10*24*time.Hour)
+	}
+	stats, err := SweepEmptyDirs(root, EmptyDirsOptions{
+		AgeGate: 7 * 24 * time.Hour,
+		Exclude: map[string]bool{DefaultTrashDir: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只删收集时即空的深度 3 叶子（10 个）；深度 2/1 因本轮才变空，留待下轮。
+	if stats.Removed != 10 {
+		t.Fatalf("removed=%d want 10 (only leaves emptied at collect time)", stats.Removed)
 	}
 }

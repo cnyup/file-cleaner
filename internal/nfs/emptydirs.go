@@ -105,57 +105,114 @@ func SweepEmptyDirs(root string, opts EmptyDirsOptions) (*EmptyDirsStats, error)
 	})
 
 	cutoff := opts.now().Add(-opts.AgeGate)
-	for _, c := range cands {
-		// 复查一：目录仍存在且 readdir 为空。
-		entries, err := os.ReadDir(c.path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				atomic.AddInt64(&stats.Skipped, 1)
-				atomic.AddInt64(&stats.SkippedGone, 1)
-				continue
-			}
-			atomic.AddInt64(&stats.Errors, 1)
-			continue
-		}
-		if len(entries) > 0 {
-			atomic.AddInt64(&stats.Skipped, 1)
-			atomic.AddInt64(&stats.SkippedNonEmpty, 1)
-			continue
-		}
-		// 复查二：年龄门（收集时刻的 mtime 快照；readdir 复查不刷 mtime，
-		// 但业务增删条目会刷——快照与复查共同覆盖竞态窗口）。
-		if c.mtime.After(cutoff) {
-			atomic.AddInt64(&stats.Skipped, 1)
-			atomic.AddInt64(&stats.SkippedYoung, 1)
-			continue
-		}
 
-		if opts.DryRun {
-			atomic.AddInt64(&stats.Removed, 1)
-			continue
-		}
-		if opts.OnRmdir != nil {
-			if err := opts.OnRmdir(c.path); err != nil {
-				atomic.AddInt64(&stats.Errors, 1)
-				continue
-			}
-		}
-		if err := os.Remove(c.path); err != nil {
-			// 复查后窗口内的竞态：ENOENT=他人已删（Gone）；
-			// ENOTEMPTY=复查后回填（NonEmpty）——按设计由内核兜底，计跳过。
-			atomic.AddInt64(&stats.Skipped, 1)
-			if os.IsNotExist(err) {
-				atomic.AddInt64(&stats.SkippedGone, 1)
-			} else {
-				atomic.AddInt64(&stats.SkippedNonEmpty, 1)
-			}
-			continue
-		}
-		atomic.AddInt64(&stats.Removed, 1)
+	// 阶段二并行删除（2026-11-10 速度分析 A）：生产实测 delete_ms 占
+	// empty_dirs 总时长 97.5%（test 121,292/130,343ms），瓶颈是每个候选
+	// 的 ReadDir 复查 + Remove 两次 NFS 往返被串行执行。
+	//
+	// 安全边界：只并行**同深度**的候选——同深度目录互不为父子，删除彼此
+	// 独立；跨深度严格串行（深度降序），保证子目录先删、父目录后判，
+	// 级联语义与串行实现完全一致。三重保险全部保留（复查 readdir、
+	// mtime 年龄门、rmdir 的 ENOTEMPTY 内核兜底）。
+	deleteWorkers := opts.DirWorkers
+	if deleteWorkers <= 0 {
+		deleteWorkers = 8
 	}
+	for start := 0; start < len(cands); {
+		// 切出当前深度的一组（cands 已按深度降序排序）。
+		end := start
+		curDepth := depth(cands[start].path)
+		for end < len(cands) && depth(cands[end].path) == curDepth {
+			end++
+		}
+		deleteBatch(cands[start:end], cutoff, opts, stats, deleteWorkers)
+		start = end
+	}
+
 	stats.CollectElapsed = collectElapsed
 	stats.DeleteElapsed = time.Since(deleteStart)
 	return stats, nil
+}
+
+// deleteBatch 并行删除同一深度的候选（互不为父子，安全并行）。
+// 跨批次由调用方按深度降序串行推进，保证父子顺序。
+func deleteBatch(batch []emptyDirCandidate, cutoff time.Time, opts EmptyDirsOptions, stats *EmptyDirsStats, workers int) {
+	if workers > len(batch) {
+		workers = len(batch)
+	}
+	if workers <= 1 {
+		for _, c := range batch {
+			removeCandidate(c, cutoff, opts, stats)
+		}
+		return
+	}
+	ch := make(chan emptyDirCandidate, len(batch))
+	for _, c := range batch {
+		ch <- c
+	}
+	close(ch)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range ch {
+				removeCandidate(c, cutoff, opts, stats)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// removeCandidate 单个候选的复查与删除（原串行循环体，语义未变）。
+// 统计全部走 atomic，可被多个 worker 并发调用。
+func removeCandidate(c emptyDirCandidate, cutoff time.Time, opts EmptyDirsOptions, stats *EmptyDirsStats) {
+	// 复查一：目录仍存在且 readdir 为空。
+	entries, err := os.ReadDir(c.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			atomic.AddInt64(&stats.Skipped, 1)
+			atomic.AddInt64(&stats.SkippedGone, 1)
+			return
+		}
+		atomic.AddInt64(&stats.Errors, 1)
+		return
+	}
+	if len(entries) > 0 {
+		atomic.AddInt64(&stats.Skipped, 1)
+		atomic.AddInt64(&stats.SkippedNonEmpty, 1)
+		return
+	}
+	// 复查二：年龄门（收集时刻的 mtime 快照；readdir 复查不刷 mtime，
+	// 但业务增删条目会刷——快照与复查共同覆盖竞态窗口）。
+	if c.mtime.After(cutoff) {
+		atomic.AddInt64(&stats.Skipped, 1)
+		atomic.AddInt64(&stats.SkippedYoung, 1)
+		return
+	}
+
+	if opts.DryRun {
+		atomic.AddInt64(&stats.Removed, 1)
+		return
+	}
+	if opts.OnRmdir != nil {
+		if err := opts.OnRmdir(c.path); err != nil {
+			atomic.AddInt64(&stats.Errors, 1)
+			return
+		}
+	}
+	if err := os.Remove(c.path); err != nil {
+		// 复查后窗口内的竞态：ENOENT=他人已删（Gone）；
+		// ENOTEMPTY=复查后回填（NonEmpty）——按设计由内核兜底，计跳过。
+		atomic.AddInt64(&stats.Skipped, 1)
+		if os.IsNotExist(err) {
+			atomic.AddInt64(&stats.SkippedGone, 1)
+		} else {
+			atomic.AddInt64(&stats.SkippedNonEmpty, 1)
+		}
+		return
+	}
+	atomic.AddInt64(&stats.Removed, 1)
 }
 
 // collectEmptyDirs 阶段一：并发遍历收集空目录候选（含 inode 时间戳）。
