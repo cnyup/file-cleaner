@@ -104,12 +104,9 @@ func (m *Mover) sweepDir(dir string, alreadyPurging bool, progress *sweepProgres
 				return totalFiles, totalDirs, fmt.Errorf("sweep: stage %s: %w", bucket, err)
 			}
 		}
-		n, dn, err := m.deleteTree(target)
+		n, dn, err := m.deleteTree(target, progress)
 		totalFiles += n
 		totalDirs += dn
-		if progress != nil {
-			progress.add(uint32(n), uint32(dn))
-		}
 		if err != nil {
 			return totalFiles, totalDirs, err
 		}
@@ -118,7 +115,9 @@ func (m *Mover) sweepDir(dir string, alreadyPurging bool, progress *sweepProgres
 }
 
 // deleteTree 逐文件 unlink + 自底向上 rmdir。返回删除文件数与目录数。
-func (m *Mover) deleteTree(root string) (int, int, error) {
+// progress 非 nil 时逐文件累加（桶内进度可见，2026-11-11 观察项 1）——
+// 旧实现只在整桶删完后累加一次，单桶 645k files / 133 分钟期间心跳恒 0。
+func (m *Mover) deleteTree(root string, progress *sweepProgress) (int, int, error) {
 	// 后序遍历：先文件后目录。
 	var walk func(dir string) (int, int, error)
 	walk = func(dir string) (int, int, error) {
@@ -145,6 +144,9 @@ func (m *Mover) deleteTree(root string) (int, int, error) {
 					return n, dn, err
 				}
 				n++
+				if progress != nil {
+					progress.add(1, 0)
+				}
 				continue
 			}
 			// unlink 带限速（moveSem）保证不冲垮 NFS
@@ -159,12 +161,18 @@ func (m *Mover) deleteTree(root string) (int, int, error) {
 				return n, dn, err
 			}
 			n++
+			if progress != nil {
+				progress.add(1, 0)
+			}
 		}
 		if dir != root {
 			if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
 				return n, dn, err
 			}
 			dn++
+			if progress != nil {
+				progress.add(0, 1)
+			}
 		}
 		return n, dn, nil
 	}
@@ -176,6 +184,9 @@ func (m *Mover) deleteTree(root string) (int, int, error) {
 		return n, dn, err
 	}
 	dn++ // 桶根
+	if progress != nil {
+		progress.add(0, 1)
+	}
 	return n, dn, nil
 }
 
@@ -201,7 +212,7 @@ func (p *sweepProgress) load() (files, dirs uint32) {
 // stopBeat 由 SweepOnce 关闭；beatDone 由本函数关闭（同步回收 goroutine）。
 func sweepHeartbeat(beat func(string), policyID string, progress *sweepProgress, stop, done chan struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	emit := func() {
 		f, d := progress.load()
@@ -217,3 +228,6 @@ func sweepHeartbeat(beat func(string), policyID string, progress *sweepProgress,
 		}
 	}
 }
+
+// heartbeatInterval 心跳周期（测试可缩短以观测桶内进度采样）。
+var heartbeatInterval = 5 * time.Minute

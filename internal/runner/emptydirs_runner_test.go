@@ -182,6 +182,18 @@ func TestRunOnceEmptyDirsAuditTrail(t *testing.T) {
 				if _, ok := tot["totals"].(map[string]any)["total_ms"]; !ok {
 					t.Fatal("run_finished totals missing total_ms")
 				}
+				// pipeline_ms（2026-11-11 报告观察项 2）：total_ms 不含
+				// empty_dirs 尾扫，导致 empty_dirs_ms > total_ms 看似矛盾。
+				// 新增语义明确的 pipeline_ms（= scan+drain），total_ms 保留
+				// 向后兼容（同值）。
+				tt := tot["totals"].(map[string]any)
+				pipelineMS, ok := tt["pipeline_ms"]
+				if !ok {
+					t.Fatal("run_finished totals missing pipeline_ms")
+				}
+				if pipelineMS != tt["total_ms"] {
+					t.Fatalf("pipeline_ms=%v != total_ms=%v (must be same value)", pipelineMS, tt["total_ms"])
+				}
 				if _, ok := tot["totals"].(map[string]any)["empty_dirs_ms"]; !ok {
 					t.Fatal("run_finished totals missing empty_dirs_ms")
 				}

@@ -268,6 +268,11 @@ func RunOnce(ctx context.Context, cfg *config.Config, p *config.Policy, dryRun b
 		"already_gone": stats.AlreadyGone,
 		"scan_ms": stats.ScanElapsed.Milliseconds(), "drain_ms": stats.DrainElapsed.Milliseconds(),
 		"total_ms": stats.TotalElapsed.Milliseconds(), "empty_dirs_ms": stats.EmptyDirsElapsed.Milliseconds(),
+		// pipeline_ms（2026-11-11 报告观察项 2）：与 total_ms 同值，但语义
+		// 明确——只覆盖 pipeline 阶段（scan+drain），不含 empty_dirs 尾扫。
+		// 旧字段 total_ms 名不副实（empty_dirs_ms 可能大于它），保留以兼容
+		// 既有消费者；新代码请读 pipeline_ms。
+		"pipeline_ms": stats.TotalElapsed.Milliseconds(),
 		"empty_dirs_candidates": stats.EmptyDirsCandidates, "empty_dirs_removed": stats.EmptyDirsRemoved,
 		"empty_dirs_skipped": stats.EmptyDirsSkipped, "empty_dirs_errors": stats.EmptyDirsErrors,
 		// 计时拆分（2026-11-09 速度分析 C）：裁决"扫还是删"是瓶颈。

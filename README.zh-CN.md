@@ -81,8 +81,9 @@ sequenceDiagram
 |---|---|
 | `moved` / `move_errors` | 物理移动结果（批事务真相，非入队计数）。`move_errors` 只计**真**失败（EACCES 等）——非零即需人工关注。 |
 | `already_gone` | 扫描后、移动前被业务侧删走的文件（ENOENT）。良性竞态非失败；不进 `move_errors`，但 per-file 审计 result 仍记 `ok:false`（restore 投影 fail-closed）。 |
-| `scan_ms` / `drain_ms` / `total_ms` / `empty_dirs_ms` | 分阶段耗时：扫描+判定 / 移动排空 / **仅覆盖扫描+排空（不含空目录尾扫）** / 空目录尾扫（第二次全树走）——用于长轮次归因。跨阶段算术请用 `run_finished.ts − run 起点`（起点 UnixNano 内嵌在 `run_id`）。 |
+| `scan_ms` / `drain_ms` / `pipeline_ms` / `total_ms` / `empty_dirs_ms` | 分阶段耗时：扫描+判定 / 移动排空 / **仅覆盖扫描+排空（不含空目录尾扫）** / 空目录尾扫（第二次全树走）——用于长轮次归因。跨阶段算术请用 `run_finished.ts − run 起点`（起点 UnixNano 内嵌在 `run_id`）。 |
 | `empty_dirs_collect_ms` / `empty_dirs_delete_ms` | 尾扫两段拆分：并发遍历收集候选（含逐目录 lstat/readdir）vs. 排序+复查/rmdir，二者之和 = `empty_dirs_ms`。生产数据显示删除段占绝对大头（约 97.5%），故删除阶段对**同深度**候选并行（并发度 = `dir_read_workers`），跨深度仍严格串行——父子顺序与三重安全保险不变。 |
+| `pipeline_ms` | 与 `total_ms` 同值：仅 scan + drain，**不含**空目录尾扫。`total_ms` 保留向后兼容但名不副实（`empty_dirs_ms` 可能大于它），新消费者请读 `pipeline_ms`。 |
 | `errors` | 扫描期文件系统错误（无法 stat 的条目、无法读的目录）。>0 时同事件附带最多 8 条路径样本（`walk_err_samples`）——ENOENT 竞态噪声与真实故障可区分。 |
 | `empty_dirs_skipped_nonempty` / `empty_dirs_skipped_young` / `empty_dirs_skipped_gone` | 空目录尾扫 skip 原因分桶：复查时已非空（业务回填）vs mtime 未过年龄门 vs 复查时已消失（ENOENT）。`empty_dirs_skipped` 仍为合计（向后兼容）。 |
 

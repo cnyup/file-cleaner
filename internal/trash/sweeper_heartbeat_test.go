@@ -74,3 +74,58 @@ func TestSweepOnceHeartbeatNil(t *testing.T) {
 		t.Fatalf("SweepOnce with nil heartbeat: %v", err)
 	}
 }
+
+// TestSweepOnceHeartbeatProgressWithinBucket 桶内进度可见性
+// （2026-11-11 报告观察项 1）：单桶 645k files 删除 133 分钟内心跳恒 0，
+// 因为旧实现 progress.add 只在整桶删完后调用一次（sweeper.go 原 :132），
+// 桶内 64 万文件的删除过程完全不可见。
+//
+// 验证方式：直接调用 deleteTree 并检查 progress 在返回前已等于总数。
+// 旧实现下 deleteTree 完全不碰 progress（调用方事后才 add），此断言红；
+// 新实现在每个 unlink 后累加，断言绿。
+func TestSweepOnceHeartbeatProgressWithinBucket(t *testing.T) {
+	layout, root, _ := setup(t)
+	jl := jlOpen(t, root)
+	defer jl.Close()
+	m := NewMover(layout, jl)
+
+	bucket := layout.NewBucketName(nowForTest())
+	dir := filepath.Join(layout.PurgingDir(), bucket)
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const nFiles = 200
+	for i := 0; i < nFiles; i++ {
+		if err := os.WriteFile(filepath.Join(sub, "f"+itoa3(i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var progress sweepProgress
+	n, dn, err := m.deleteTree(dir, &progress)
+	if err != nil {
+		t.Fatalf("deleteTree: %v", err)
+	}
+	if n != nFiles {
+		t.Fatalf("deleteTree files=%d want %d", n, nFiles)
+	}
+	// 关键断言：progress 必须由 deleteTree 自身累加（而非调用方事后补）。
+	f, d := progress.load()
+	if f != uint32(n) {
+		t.Fatalf("progress files=%d want %d — deleteTree must accumulate progress per unlink", f, n)
+	}
+	if d != uint32(dn) {
+		t.Fatalf("progress dirs=%d want %d", d, dn)
+	}
+}
+
+func itoa3(n int) string {
+	if n < 10 {
+		return "00" + string(rune('0'+n))
+	}
+	if n < 100 {
+		return "0" + string(rune('0'+n/10)) + string(rune('0'+n%10))
+	}
+	return string(rune('0'+n/100)) + string(rune('0'+(n/10)%10)) + string(rune('0'+n%10))
+}
