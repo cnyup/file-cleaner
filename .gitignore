@@ -5,6 +5,10 @@
 
 # 本地运维文件（不进公开仓库）
 AGENTS.md
-config.nas-prod-ali-bj.yaml
 docs/handover-*.md
 .rivet.md
+
+# 生产配置一律不入库（只保留 config.example.yaml 作为模板）
+config.prod.yaml
+config.*.yaml
+!config.example.yaml
