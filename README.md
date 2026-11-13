@@ -35,6 +35,7 @@ The short version: `find` optimizes for *space reclaim now*. filecleaner optimiz
 - **Per-policy matching** — cron schedule, `mtime`/`ctime`/`atime` conditions combined with AND/OR, quiet-period check, basename dir excludes, glob/regex file excludes.
 - **Empty-directory sweep** — removes directories that are empty and mtime-older than a gate (POSIX mtime updates on entry add/remove, so freshly-emptied dirs are naturally protected). Three-layer safety: readdir recheck → age gate → kernel `ENOTEMPTY` backstop.
 - **NFS-tuned concurrency** — separate worker pools for directory reads, `lstat` storms, and rename batches. Throughput bottleneck on deep-narrow trees is directory traversal, not stat parallelism (bench-proven; see below).
+- **Scan cost is bounded by cold-cache traversal, not by retention.** Widening retention does not reduce `lstat` calls. Three optimisation candidates (larger `acdirmax`, pre-warm scan, off-peak scheduling) were measured on 2026-11-13 — see [`docs/operations.md`](docs/operations.md#scan-耗时优化三个候选方案与实测结论) for the numbers and which ones do **not** pay off.
 - **Crash-safe three-zone lifecycle** — active buckets / `.retired/` / `.purging/` separated by atomic renames; restart resumes physical deletion idempotently.
 - **Single static binary** — pure Go, `CGO_ENABLED=0`, no runtime deps beyond the SQLite projection (modernc, no cgo).
 

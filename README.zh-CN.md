@@ -31,6 +31,7 @@
 - **策略级匹配**——cron 调度、`mtime`/`ctime`/`atime` 条件 AND/OR 组合、静默期检查、basename 目录排除、glob/正则文件排除。
 - **空目录清理**——只删「空且 mtime 超龄」的目录（POSIX 目录 mtime 在条目增删时都更新，刚清空的目录天然被挡住）。三重保险：删前 readdir 复查 → mtime 年龄门 → 内核 `ENOTEMPTY` 兜底。
 - **NFS 调优并发**——目录读取、`lstat` 风暴、rename 批处理分别独立 worker 池。深窄树的吞吐瓶颈在目录遍历而非 stat 并行（bench 实证，见下文）。
+- **扫描成本由冷缓存遍历决定，与保留期无关**——放宽 retention 不减少 `lstat` 次数。三个优化候选（调大 `acdirmax`、扫描前预热、错峰调度）已于 2026-11-13 实测，数字与「哪些无效」见 [`docs/operations.md`](docs/operations.md#scan-耗时优化三个候选方案与实测结论)。
 - **崩溃安全的三区生命周期**——活跃桶 / `.retired/` / `.purging/` 由原子 rename 分隔，重启后幂等续删。
 - **单静态二进制**——纯 Go、`CGO_ENABLED=0`，除 SQLite 投影（modernc 纯 Go 实现）外零运行时依赖。
 
