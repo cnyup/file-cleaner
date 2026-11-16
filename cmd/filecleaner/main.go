@@ -49,6 +49,8 @@ func main() {
 		code = runDaemon(os.Args[2:])
 	case "sweep":
 		code = runSweep(os.Args[2:])
+	case "empty-dirs":
+		code = runEmptyDirs(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "filecleaner: unknown subcommand %q\n", os.Args[1])
 		code = 2
