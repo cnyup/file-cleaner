@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/bcyup/filecleaner/internal/config"
 	"github.com/bcyup/filecleaner/internal/runner"
@@ -21,6 +22,7 @@ func runEmptyDirs(args []string) int {
 	cfgPath := fs.String("config", "config.yaml", "config file")
 	policyID := fs.String("policy", "", "policy id (empty = all policies with empty_dirs enabled)")
 	dryRun := fs.Bool("dry-run", false, "count candidates without deleting")
+	ignoreWindow := fs.Bool("ignore-window", false, "override streaming window guard (debug only; daytime readdir on mega-dirs stalls the NAS)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -58,6 +60,22 @@ func runEmptyDirs(args []string) int {
 
 	exit := 0
 	for _, p := range targets {
+		// 窗口熔断（mode=streaming 必配窗口）：窗外拒绝启动。白天对巨目录
+		// readdir 是实测过的生产风险（探针①：首 READDIR 8 分钟不返回，
+		// 进程 D 态；探针⑥：夜间同目录 ~3.2k/s——60 倍差距），不是提示，
+		// 是硬拒绝。--ignore-window 显式覆盖（仅限排障）。
+		if p.EmptyDirs.Mode == "streaming" && p.EmptyDirs.Window != "" && !*ignoreWindow {
+			if in, err := config.InWindow(p.EmptyDirs.Window, time.Now()); err != nil {
+				fmt.Fprintf(os.Stderr, "empty-dirs: policy %q: %v\n", p.ID, err)
+				exit = 1
+				continue
+			} else if !in {
+				fmt.Fprintf(os.Stderr, "empty-dirs: policy %q: now %s is outside window %q — daytime readdir on mega-dirs stalls the NAS (measured 60x slower than night). Use --ignore-window to override.\n",
+					p.ID, time.Now().Format("15:04"), p.EmptyDirs.Window)
+				exit = 1
+				continue
+			}
+		}
 		res, err := runner.RunEmptyDirs(cfg, p, *dryRun)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "empty-dirs: %v\n", err)

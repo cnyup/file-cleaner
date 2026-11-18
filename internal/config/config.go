@@ -115,6 +115,18 @@ type Policy struct {
 type EmptyDirs struct {
 	Enabled   bool   `yaml:"enabled"`
 	Retention string `yaml:"retention"` // 年龄门；enabled 时必填且合法（Validate fail-closed）
+	// Mode 引擎选择（2026-11-18 temp 巨目录探针结论落地）：
+	//   空/"legacy" = SweepEmptyDirs 两阶段（默认，普通目录规模）；
+	//   "streaming" = 流式引擎（单目录百万级直接子目录：顺序 cookie 链 +
+	//     checkpoint 断点续扫 + 读删重叠，见 internal/nfs/emptydirs_streaming.go）。
+	Mode string `yaml:"mode"`
+	// Window 允许运行的时间窗（"HH:MM-HH:MM"，支持跨天如 "23:00-06:00"）。
+	// mode=streaming 时必填：巨目录白天 readdir 会拖垮 NAS（生产实测
+	// 白天首包 8 分钟不返回、夜间 ~3.2k/s，差 60 倍以上），必须限夜间。
+	Window string `yaml:"window"`
+	// CheckpointDir checkpoint 目录；mode=streaming 时必填（无 checkpoint
+	// 的长跑中断即重头，违反断点续扫设计）。
+	CheckpointDir string `yaml:"checkpoint_dir"`
 }
 
 // Retention 时间条件组合。
@@ -303,6 +315,23 @@ func Validate(cfg *Config) []error {
 				errs = append(errs, fmt.Errorf("policy %q: empty_dirs.retention is required when enabled (age gate prevents deleting dirs business is creating)", p.ID))
 			} else if _, err := ParseDuration(p.EmptyDirs.Retention); err != nil {
 				errs = append(errs, fmt.Errorf("policy %q: bad empty_dirs.retention: %w", p.ID, err))
+			}
+			// mode 白名单（空 = legacy）。
+			switch p.EmptyDirs.Mode {
+			case "", "legacy", "streaming":
+			default:
+				errs = append(errs, fmt.Errorf("policy %q: empty_dirs.mode must be \"legacy\" or \"streaming\", got %q", p.ID, p.EmptyDirs.Mode))
+			}
+			// streaming 专属必填（legacy 模式不校验 window/checkpoint）。
+			if p.EmptyDirs.Mode == "streaming" {
+				if p.EmptyDirs.Window == "" {
+					errs = append(errs, fmt.Errorf("policy %q: empty_dirs.window is required when mode=streaming (daytime readdir on mega-dirs stalls the NAS; measured 60x slower than night)", p.ID))
+				} else if _, _, err := ParseWindow(p.EmptyDirs.Window); err != nil {
+					errs = append(errs, fmt.Errorf("policy %q: bad empty_dirs.window: %w", p.ID, err))
+				}
+				if p.EmptyDirs.CheckpointDir == "" {
+					errs = append(errs, fmt.Errorf("policy %q: empty_dirs.checkpoint_dir is required when mode=streaming (resume across windows depends on it)", p.ID))
+				}
 			}
 		}
 		if err := validateTrashPath(p); err != nil {

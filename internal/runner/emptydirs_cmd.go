@@ -41,6 +41,11 @@ type EmptyDirsResult struct {
 	ElapsedMS  int64         `json:"elapsed_ms"`
 	CollectMS  int64         `json:"collect_ms"`
 	DeleteMS   int64         `json:"delete_ms"`
+	// streaming 模式字段（mode=streaming 时填充）。
+	Mode         string `json:"mode,omitempty"`
+	EntriesScanned int64 `json:"entries_scanned,omitempty"`
+	Resumed      int64  `json:"resumed,omitempty"`
+	Stopped      bool   `json:"stopped,omitempty"` // 到窗口尾/上限优雅停（未完，可续）
 }
 
 // RunEmptyDirs 对单个策略执行一轮空目录清理（不含文件清理）。
@@ -77,42 +82,51 @@ func RunEmptyDirs(cfg *config.Config, p *config.Policy, dryRun bool) (*EmptyDirs
 
 	var rmdirBatch []audit.RmdirIntent
 	start := time.Now()
-	estats, err := nfs.SweepEmptyDirs(p.Root, nfs.EmptyDirsOptions{
-		AgeGate:    gate,
-		Exclude:    exclude,
-		DryRun:     dryRun,
-		DirWorkers: p.Concurrency.DirReadWorkers,
-		OnRmdir: func(path string) error {
-			// 审计缓冲：与 RunOnce 同策略——批事务在尾批统一闭环。
-			rmdirBatch = append(rmdirBatch, audit.RmdirIntent{
-				RunID: runID, PolicyID: p.ID, Path: path,
-			})
-			return nil
-		},
-	})
+
+	var res *EmptyDirsResult
+	if p.EmptyDirs.Mode == "streaming" {
+		res, err = runEmptyDirsStreaming(cfg, p, gate, exclude, dryRun, &rmdirBatch)
+	} else {
+		var estats *nfs.EmptyDirsStats
+		estats, err = nfs.SweepEmptyDirs(p.Root, nfs.EmptyDirsOptions{
+			AgeGate:    gate,
+			Exclude:    exclude,
+			DryRun:     dryRun,
+			DirWorkers: p.Concurrency.DirReadWorkers,
+			OnRmdir: func(path string) error {
+				// 审计缓冲：与 RunOnce 同策略——批事务在尾批统一闭环。
+				rmdirBatch = append(rmdirBatch, audit.RmdirIntent{
+					RunID: runID, PolicyID: p.ID, Path: path,
+				})
+				return nil
+			},
+		})
+		if err == nil {
+			res = &EmptyDirsResult{
+				PolicyID:   p.ID,
+				Root:       p.Root,
+				DryRun:     dryRun,
+				AgeGate:    gate,
+				Candidates: estats.Candidates,
+				Removed:    estats.Removed,
+				Skipped:    estats.Skipped,
+				NonEmpty:   estats.SkippedNonEmpty,
+				Young:      estats.SkippedYoung,
+				Gone:       estats.SkippedGone,
+				Errors:     estats.Errors,
+				ElapsedMS:  time.Since(start).Milliseconds(),
+				CollectMS:  estats.CollectElapsed.Milliseconds(),
+				DeleteMS:   estats.DeleteElapsed.Milliseconds(),
+			}
+		}
+	}
 	elapsed := time.Since(start)
+	_ = elapsed // legacy 分支已内联计时；保留变量供后续指标统一
 	if err != nil {
 		if jl != nil {
 			jl.RunFinished(runID, p.ID, map[string]int64{"empty_dirs_error": 1})
 		}
 		return nil, fmt.Errorf("policy %q: empty_dirs sweep: %w", p.ID, err)
-	}
-
-	res := &EmptyDirsResult{
-		PolicyID:   p.ID,
-		Root:       p.Root,
-		DryRun:     dryRun,
-		AgeGate:    gate,
-		Candidates: estats.Candidates,
-		Removed:    estats.Removed,
-		Skipped:    estats.Skipped,
-		NonEmpty:   estats.SkippedNonEmpty,
-		Young:      estats.SkippedYoung,
-		Gone:       estats.SkippedGone,
-		Errors:     estats.Errors,
-		ElapsedMS:  elapsed.Milliseconds(),
-		CollectMS:  estats.CollectElapsed.Milliseconds(),
-		DeleteMS:   estats.DeleteElapsed.Milliseconds(),
 	}
 
 	// 审计尾批（仅真实删除时）：intent 批落盘 → 复查物理结果 → result 落盘。
@@ -144,6 +158,79 @@ func RunEmptyDirs(cfg *config.Config, p *config.Policy, dryRun bool) (*EmptyDirs
 		})
 	}
 	return res, nil
+}
+
+// runEmptyDirsStreaming streaming 模式的一轮（一个窗口）清理。
+// 窗口已过时返回错误（CLI 层的熔断语义在命令入口，这里是引擎侧兜底）；
+// 窗口内启动、到点优雅停（Stopped=true，checkpoint 已落，下窗口续）。
+func runEmptyDirsStreaming(cfg *config.Config, p *config.Policy, gate time.Duration, exclude map[string]bool, dryRun bool, rmdirBatch *[]audit.RmdirIntent) (*EmptyDirsResult, error) {
+	stopAt, err := windowStopAt(p.EmptyDirs.Window, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	runID := fmt.Sprintf("%s-emptydirs-streaming-%d", p.ID, time.Now().UnixNano())
+	_ = runID // runID 由调用方生成；这里仅内部引用占位
+	estats, err := nfs.SweepEmptyDirsStreaming(p.Root, nfs.EmptyDirsStreamingOptions{
+		AgeGate:       gate,
+		Exclude:       exclude,
+		DryRun:        dryRun,
+		CheckpointDir: p.EmptyDirs.CheckpointDir,
+		StopAt:        stopAt,
+		Workers:       p.Concurrency.DirReadWorkers,
+		OnRmdir: func(path string) error {
+			*rmdirBatch = append(*rmdirBatch, audit.RmdirIntent{
+				RunID: runID, PolicyID: p.ID, Path: path,
+			})
+			return nil
+		},
+		Now: time.Now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &EmptyDirsResult{
+		PolicyID:   p.ID,
+		Root:       p.Root,
+		DryRun:     dryRun,
+		AgeGate:    gate,
+		Mode:       "streaming",
+		Candidates: estats.EntriesScanned,
+		Removed:    estats.Removed,
+		Skipped:    estats.SkippedYoung + estats.SkippedNonEmpty + estats.SkippedGone + estats.SkippedExclude,
+		NonEmpty:   estats.SkippedNonEmpty,
+		Young:      estats.SkippedYoung,
+		Gone:       estats.SkippedGone,
+		Errors:     estats.Errors,
+		ElapsedMS:  estats.Elapsed.Milliseconds(),
+		EntriesScanned: estats.EntriesScanned,
+		Resumed:    estats.Resumed,
+		Stopped:    estats.Stopped,
+	}, nil
+}
+
+// windowStopAt 把窗口配置换算成本轮的绝对停止时刻：
+//   - 当前在窗口内：本窗口的结束时刻（今天或明天，跨天窗口自动处理）；
+//   - 当前在窗口外：返回错误（调用方决定拒绝——白天对巨目录 readdir
+//     是实测过的生产风险，不是理论风险）。
+func windowStopAt(w string, now time.Time) (time.Time, error) {
+	s, e, err := config.ParseWindow(w)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("empty_dirs.window: %w", err)
+	}
+	in, err := config.InWindow(w, now)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !in {
+		return time.Time{}, fmt.Errorf("current time %s is outside window %q (daytime readdir on mega-dirs stalls the NAS; measured 60x slower than night) — refusing to start",
+			now.Format("15:04"), w)
+	}
+	// 今日窗口结束时刻；跨天窗口（s > e）且当前已过 s → 结束在明天。
+	endToday := time.Date(now.Year(), now.Month(), now.Day(), e/60, e%60, 0, 0, now.Location())
+	if s > e && now.Hour()*60+now.Minute() >= s {
+		endToday = endToday.AddDate(0, 0, 1)
+	}
+	return endToday, nil
 }
 
 // emptyDirsTrashPath 辅助：返回策略回收站的绝对路径（供调用方打印提示）。
