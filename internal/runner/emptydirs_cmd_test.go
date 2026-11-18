@@ -11,6 +11,7 @@ package runner
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,3 +140,42 @@ func TestRunEmptyDirsNotEnabledFails(t *testing.T) {
 }
 
 // 注：backdateDir 已在 emptydirs_runner_test.go 定义，同包复用。
+
+// TestWindowStopAtCases 窗口→绝对停止时刻换算（2026-11-18 streaming 落地）：
+// 窗口内返回本窗结束；跨天窗口前半夜返回次日结束、后半夜返回当天结束；
+// 窗外返回错误（文本含窗口与当前时刻）。
+func TestWindowStopAtCases(t *testing.T) {
+	mk := func(h, m int) time.Time { return time.Date(2026, 11, 18, h, m, 0, 0, time.Local) }
+	cases := []struct {
+		name   string
+		window string
+		at     time.Time
+		want   time.Time
+		errSub string
+	}{
+		{"in-window mid", "01:00-07:00", mk(3, 0), mk(7, 0), ""},
+		{"in-window at start", "01:00-07:00", mk(1, 0), mk(7, 0), ""},
+		{"outside window", "01:00-07:00", mk(12, 0), time.Time{}, "outside window"},
+		{"cross-day late night", "23:00-06:00", mk(23, 30), mk(6, 0).AddDate(0, 0, 1), ""},
+		{"cross-day early morning", "23:00-06:00", mk(2, 0), mk(6, 0), ""},
+		{"bad window", "9:00", mk(2, 0), time.Time{}, "want HH:MM"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := windowStopAt(tc.window, tc.at)
+			if tc.errSub != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.errSub) {
+					t.Fatalf("want err containing %q, got %v", tc.errSub, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("windowStopAt(%q,%s): %v", tc.window, tc.at, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("windowStopAt(%q, %s) = %s, want %s",
+					tc.window, tc.at.Format("15:04"), got, tc.want)
+			}
+		})
+	}
+}
