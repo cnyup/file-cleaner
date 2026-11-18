@@ -76,7 +76,7 @@ func runEmptyDirs(args []string) int {
 				continue
 			}
 		}
-		res, err := runner.RunEmptyDirs(cfg, p, *dryRun)
+		res, err := runner.RunEmptyDirs(cfg, p, *dryRun, runner.WithIgnoreWindow(*ignoreWindow))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "empty-dirs: %v\n", err)
 			exit = 1

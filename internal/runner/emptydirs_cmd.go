@@ -51,7 +51,10 @@ type EmptyDirsResult struct {
 // RunEmptyDirs 对单个策略执行一轮空目录清理（不含文件清理）。
 // dryRun=true 时只统计不删除。审计：复用策略的 state_dir，落 rmdir 事务；
 // dryRun 时不写审计（无实际删除）。
-func RunEmptyDirs(cfg *config.Config, p *config.Policy, dryRun bool) (*EmptyDirsResult, error) {
+// opts 可选：WithIgnoreWindow(true) 贯穿 streaming 引擎的窗口熔断
+// （--ignore-window 调试逃生口；生产 cron 永远不带）。
+func RunEmptyDirs(cfg *config.Config, p *config.Policy, dryRun bool, opts ...EmptyDirsOption) (*EmptyDirsResult, error) {
+	oc := emptyDirsOptChain{}
 	if !p.EmptyDirs.Enabled {
 		return nil, fmt.Errorf("policy %q: empty_dirs not enabled in config", p.ID)
 	}
@@ -82,10 +85,13 @@ func RunEmptyDirs(cfg *config.Config, p *config.Policy, dryRun bool) (*EmptyDirs
 
 	var rmdirBatch []audit.RmdirIntent
 	start := time.Now()
+	for _, o := range opts {
+		o(&oc)
+	}
 
 	var res *EmptyDirsResult
 	if p.EmptyDirs.Mode == "streaming" {
-		res, err = runEmptyDirsStreaming(cfg, p, gate, exclude, dryRun, &rmdirBatch)
+		res, err = runEmptyDirsStreaming(cfg, p, gate, exclude, dryRun, &rmdirBatch, oc.ignoreWindow)
 	} else {
 		var estats *nfs.EmptyDirsStats
 		estats, err = nfs.SweepEmptyDirs(p.Root, nfs.EmptyDirsOptions{
@@ -160,13 +166,30 @@ func RunEmptyDirs(cfg *config.Config, p *config.Policy, dryRun bool) (*EmptyDirs
 	return res, nil
 }
 
+// emptyDirsOptChain 选项链聚合结果。
+type emptyDirsOptChain struct {
+	ignoreWindow bool
+}
+
+// EmptyDirsOption RunEmptyDirs 的可选参数。
+type EmptyDirsOption func(*emptyDirsOptChain)
+
+// WithIgnoreWindow 贯穿窗口熔断到 streaming 引擎（--ignore-window）。
+func WithIgnoreWindow(v bool) EmptyDirsOption {
+	return func(c *emptyDirsOptChain) { c.ignoreWindow = v }
+}
+
 // runEmptyDirsStreaming streaming 模式的一轮（一个窗口）清理。
 // 窗口已过时返回错误（CLI 层的熔断语义在命令入口，这里是引擎侧兜底）；
 // 窗口内启动、到点优雅停（Stopped=true，checkpoint 已落，下窗口续）。
-func runEmptyDirsStreaming(cfg *config.Config, p *config.Policy, gate time.Duration, exclude map[string]bool, dryRun bool, rmdirBatch *[]audit.RmdirIntent) (*EmptyDirsResult, error) {
+func runEmptyDirsStreaming(cfg *config.Config, p *config.Policy, gate time.Duration, exclude map[string]bool, dryRun bool, rmdirBatch *[]audit.RmdirIntent, ignoreWindow bool) (*EmptyDirsResult, error) {
 	stopAt, err := windowStopAt(p.EmptyDirs.Window, time.Now())
 	if err != nil {
-		return nil, err
+		if !ignoreWindow {
+			return nil, err
+		}
+		// ignoreWindow：窗外照跑，StopAt 置零（不限时，调试语义）。
+		stopAt = time.Time{}
 	}
 	runID := fmt.Sprintf("%s-emptydirs-streaming-%d", p.ID, time.Now().UnixNano())
 	_ = runID // runID 由调用方生成；这里仅内部引用占位
