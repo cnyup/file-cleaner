@@ -52,6 +52,11 @@ type EmptyDirsStreamingOptions struct {
 	Workers int
 	// BatchSize 每批条目数 = checkpoint 周期（<=0 取 500）。
 	BatchSize int
+	// StallTimeout 批处理时限（2026-11-19 生产首窗口教训：rmdir 挂死在
+	// hard mount 上时 wg.Wait 永久阻塞，窗口熔断只防批间不防批内）。
+	// 超时即放弃等待、Stopped=true 退出——卡死变可重试。<=0 不启用
+	// （默认行为不变）；生产建议 10m。
+	StallTimeout time.Duration
 	// Now 可注入时钟（测试；nil = time.Now）。
 	Now func() time.Time
 }
@@ -67,7 +72,8 @@ type EmptyDirsStreamingStats struct {
 	SkippedExclude  int64 // 命中排除集
 	Errors          int64 // 其他错误
 	Checkpointed    int64 // checkpoint 落盘次数
-	Stopped         bool  // 到达 StopAt/MaxEntries 优雅停止（未完，可续）
+	Stalled         int64 // 批处理超时次数（StallTimeout 触发；服务端挂起的信号）
+	Stopped         bool  // 到达 StopAt/MaxEntries/批超时 优雅或保护性退出（未完，可续）
 	Elapsed         time.Duration
 }
 
@@ -155,28 +161,54 @@ func SweepEmptyDirsStreaming(root string, opts EmptyDirsStreamingOptions) (*Empt
 		}
 
 		// 批内并发处理（同层目录互不为父子）。
+		// 2026-11-19 生产卡死教训补全：派发（sem 获取）与 worker（rmdir）
+		// 任一环节挂起都会卡死批——超时保护必须罩住「派发+等待」整段，
+		// 只罩 wg.Wait 不够（派发 goroutine 自身可阻塞在 sem）。
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, opts.Workers)
-		for _, e := range batch {
-			if !e.isDir {
-				// 文件条目：巨目录里出现文件说明业务在用 root——只计数。
-				atomic.AddInt64(&stats.SkippedNonEmpty, 1)
-				continue
+		stallErr := false
+		dispatch := func() {
+			for _, e := range batch {
+				if !e.isDir {
+					// 文件条目：巨目录里出现文件说明业务在用 root——只计数。
+					atomic.AddInt64(&stats.SkippedNonEmpty, 1)
+					continue
+				}
+				if opts.Exclude[e.name] {
+					atomic.AddInt64(&stats.SkippedExclude, 1)
+					continue
+				}
+				full := root + "/" + e.name
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(full string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					processStreamingEntry(full, cutoff, opts, stats)
+				}(full)
 			}
-			if opts.Exclude[e.name] {
-				atomic.AddInt64(&stats.SkippedExclude, 1)
-				continue
-			}
-			full := root + "/" + e.name
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(full string) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				processStreamingEntry(full, cutoff, opts, stats)
-			}(full)
 		}
-		wg.Wait()
+		if opts.StallTimeout > 0 {
+			done := make(chan struct{})
+			go func() { dispatch(); wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(opts.StallTimeout):
+				// 放弃等待：泄漏的 dispatch/worker goroutine 无害化——
+				// 它们只写 atomic 计数器，函数返回后 stats 不再被读取方
+				// 依赖（结果已快照）。不落本批 checkpoint（cookie 未推进，
+				// 下轮重扫本批；rmdir 幂等，ENOENT 计 Gone，安全）。
+				atomic.AddInt64(&stats.Stalled, 1)
+				stats.Stopped = true
+				stallErr = true
+			}
+		} else {
+			dispatch()
+			wg.Wait()
+		}
+		if stallErr {
+			return stats, nil
+		}
 
 		handled += int64(len(batch))
 		stats.EntriesScanned = handled
